@@ -44,8 +44,8 @@ endif
 
 all : kloak
 
-kloak : src/kloak.c src/kloak.h src/xdg-shell-protocol.h src/xdg-shell-protocol.c src/wlr-layer-shell.c src/wlr-layer-shell.h
-	$(CC) src/kloak.c src/xdg-shell-protocol.c src/wlr-layer-shell.c -o kloak -lm -lrt $(shell $(PKG_CONFIG) --cflags --libs libinput) $(shell $(PKG_CONFIG) --cflags --libs libevdev) $(shell $(PKG_CONFIG) --cflags --libs wayland-client)
+kloak : src/kloak.c src/kloak.h src/xdg-shell-protocol.h src/xdg-shell-protocol.c src/wlr-layer-shell.c src/wlr-layer-shell.h src/wlr-virtual-pointer.c src/wlr-virtual-pointer.h
+	$(CC) src/kloak.c src/xdg-shell-protocol.c src/wlr-layer-shell.c src/wlr-virtual-pointer.c -o kloak -lm -lrt $(shell $(PKG_CONFIG) --cflags --libs libinput) $(shell $(PKG_CONFIG) --cflags --libs libevdev) $(shell $(PKG_CONFIG) --cflags --libs wayland-client)
 
 clean :
 	rm -f kloak

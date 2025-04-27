@@ -16,11 +16,15 @@
 #include <stdbool.h>
 #include <sys/types.h>
 #include <dirent.h>
+#include <time.h>
 
 #include <wayland-client.h>
 #include "wlr-layer-shell.h"
+#include "wlr-virtual-pointer.h"
 
 #include <libinput.h>
+
+#include <libevdev/libevdev.h>
 
 #include "kloak.h"
 
@@ -28,8 +32,8 @@
 /* global variables */
 /********************/
 
-int crosshair_x = 0;
-int crosshair_y = 0;
+double crosshair_x = 0;
+double crosshair_y = 0;
 
 bool frame_released = true;
 bool frame_pending = true;
@@ -101,7 +105,7 @@ static int create_shm_file(size_t size)
   } while (ret < 0 && errno == EINTR);
   if (ret < 0) {
     close(fd);
-    panic("Could not allocate shared memory block", errno);
+    panic("Could not allocate shared memory block", -errno);
   }
 
   return fd;
@@ -119,11 +123,15 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
       &wl_compositor_interface, 5);
   } else if (strcmp(interface, wl_shm_interface.name) == 0) {
     state->shm = wl_registry_bind(registry, name, &wl_shm_interface, 2);
-  }else if (strcmp(interface, wl_output_interface.name) == 0) {
+  } else if (strcmp(interface, wl_output_interface.name) == 0) {
     state->output = wl_registry_bind(registry, name, &wl_output_interface, 4);
   } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
     state->layer_shell = wl_registry_bind(registry, name,
       &zwlr_layer_shell_v1_interface, 4);
+  } else if (
+    strcmp(interface, zwlr_virtual_pointer_manager_v1_interface.name) == 0) {
+    state->virt_pointer_manager = wl_registry_bind(registry, name,
+      &zwlr_virtual_pointer_manager_v1_interface, 2);
   }
 }
 
@@ -144,7 +152,7 @@ static void layer_surface_configure(void *data,
   state->layer.width = width;
   state->layer.height = height;
   state->layer.stride = width * 4;
-  state->layer.size = width * state->layer.stride * height;;
+  state->layer.size = state->layer.stride * (size_t) height;
   int shm_fd = create_shm_file(state->layer.size);
   if (shm_fd == -1)
     panic("Cannot allocate shared memory block for frame", errno);
@@ -157,6 +165,10 @@ static void layer_surface_configure(void *data,
   state->layer.shm_pool = wl_shm_create_pool(state->shm, shm_fd,
     state->layer.size);
 
+  struct wl_region *zeroed_region = wl_compositor_create_region(state->compositor);
+  wl_region_add(zeroed_region, 0, 0, 0, 0);
+  wl_surface_set_input_region(state->layer.surface, zeroed_region);
+
   zwlr_layer_surface_v1_ack_configure(layer_surface, serial);
   state->layer.layer_surface_configured = true;
   draw_frame(state);
@@ -168,6 +180,21 @@ static void layer_surface_configure(void *data,
 
 static int li_open_restricted(const char *path, int flags, void *user_data) {
   int fd = open(path, flags);
+  struct libevdev *evdev_dev;
+  int err = libevdev_new_from_fd(fd, &evdev_dev);
+  if (err != 0) {
+    fprintf(stderr, "FATAL ERROR: Could not create evdev for input device '%s'!\n", path);
+    exit(1);
+  }
+  const char *dev_name = libevdev_get_name(evdev_dev);
+  if (strstr(dev_name, "keyboard") == NULL) {
+    int one = 1;
+    if (ioctl(fd, EVIOCGRAB, &one) < 0) {
+      fprintf(stderr, "FATAL ERROR: Could not grab evdev device '%s'!\n", path);
+      exit(1);
+    }
+  }
+  printf("%s\n", dev_name);
   li_fds[li_fd_count] = fd;
   ++li_fd_count;
   return fd < 0 ? -errno : fd;
@@ -195,9 +222,9 @@ static void draw_frame(struct disp_state *state) {
   /* Draw a red line in the middle of the buffer */
   for (int y = 0; y < state->layer.height; ++y) {
     for (int x = 0; x < state->layer.width; ++x) {
-      if (x == crosshair_x)
+      if (x == (int) crosshair_x)
         state->layer.pixbuf[y * state->layer.width + x] = 0xffff0000;
-      else if (y == crosshair_y)
+      else if (y == (int) crosshair_y)
         state->layer.pixbuf[y * state->layer.width + x] = 0xffff0000;
       else
         state->layer.pixbuf[y * state->layer.width + x] = 0x00000000;
@@ -215,11 +242,12 @@ static void draw_frame(struct disp_state *state) {
   struct drawable_layer *layer, int layer_width, int layer_height) {*/
 static void allocate_drawable_layer(struct disp_state *state,
   struct drawable_layer *layer) {
+  layer->output = state->output;
   layer->surface = wl_compositor_create_surface(state->compositor);
   if (!layer->surface)
     panic("Could not create Wayland surface", errno);
   layer->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
-    state->layer_shell, layer->surface, state->output,
+    state->layer_shell, layer->surface, layer->output,
     ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "com.kicksecure.kloak");
   zwlr_layer_surface_v1_add_listener(layer->layer_surface,
     &layer_surface_listener, state);
@@ -233,6 +261,10 @@ static void allocate_drawable_layer(struct disp_state *state,
   zwlr_layer_surface_v1_set_anchor(layer->layer_surface,
     ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
   wl_surface_commit(layer->surface);
+
+  layer->virt_pointer
+    = zwlr_virtual_pointer_manager_v1_create_virtual_pointer_with_output(
+    state->virt_pointer_manager, NULL, layer->output);
 }
 
 static void update_virtual_cursor(enum libinput_event_type ev_type) {
@@ -244,11 +276,31 @@ static void update_virtual_cursor(enum libinput_event_type ev_type) {
       pointer_event, state.layer.width);
     double abs_y = libinput_event_pointer_get_absolute_y_transformed(
       pointer_event, state.layer.height);
-    crosshair_x = (int) abs_x;
-    crosshair_y = (int) abs_y;
+    crosshair_x = abs_x;
+    crosshair_y = abs_y;
+    frame_pending = true;
+  } else if (ev_type == LIBINPUT_EVENT_POINTER_MOTION) {
+    struct libinput_event_pointer *pointer_event
+      = libinput_event_get_pointer_event(li_event);
+    double rel_x = libinput_event_pointer_get_dx(pointer_event);
+    double rel_y = libinput_event_pointer_get_dy(pointer_event);
+    crosshair_x += rel_x;
+    crosshair_y += rel_y;
+    if (crosshair_x < 0) crosshair_x = 0;
+    if (crosshair_y < 0) crosshair_y = 0;
+    if (crosshair_x > state.layer.width) crosshair_x = state.layer.width;
+    if (crosshair_y > state.layer.height) crosshair_y = state.layer.height;
     frame_pending = true;
   }
   libinput_event_destroy(li_event);
+
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  unsigned int ts_milliseconds = ts.tv_sec * 1000;
+  ts_milliseconds += (ts.tv_nsec / 1000000);
+  zwlr_virtual_pointer_v1_motion_absolute(state.layer.virt_pointer,
+    ts_milliseconds, (unsigned int) crosshair_x, (unsigned int) crosshair_y,
+    state.layer.width, state.layer.height);
 }
 
 /****************************/
@@ -332,6 +384,7 @@ int main(int argc, char **argv) {
 
     if (frame_pending)
       draw_frame(&state);
+    wl_display_flush(state.display);
 
     poll(ev_fds, li_fd_count + 1, -1);
 
@@ -341,12 +394,14 @@ int main(int argc, char **argv) {
     } else {
       wl_display_cancel_read(state.display);
     }
+    ev_fds[0].revents = 0;
 
     for (int i = 0; i < li_fd_count; ++i) {
       if (ev_fds[i+1].revents & POLLIN) {
         libinput_dispatch(li);
         break;
       }
+      ev_fds[i+1].revents = 0;
     }
   }
 

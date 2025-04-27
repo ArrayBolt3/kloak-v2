@@ -12,16 +12,19 @@
 /*******************/
 
 struct drawable_layer {
-  int width;
-  int height;
-  int stride;
-  int size;
+  struct wl_output *output;
+  size_t width;
+  size_t height;
+  size_t stride;
+  size_t size;
   uint32_t *pixbuf;
   struct wl_surface *surface;
   struct wl_shm_pool *shm_pool;
   /* Layer shell stuff */
   struct zwlr_layer_surface_v1 *layer_surface;
   bool layer_surface_configured;
+  /* Virtual pointer */
+  struct zwlr_virtual_pointer_v1 *virt_pointer;
 };
 
 struct disp_state {
@@ -34,6 +37,7 @@ struct disp_state {
   /* TODO: Handle multiple of these, also handle hotplug */
   struct wl_output *output;
   struct zwlr_layer_shell_v1 *layer_shell;
+  struct zwlr_virtual_pointer_manager_v1 *virt_pointer_manager;
 
   /* window and buffer properties */
   struct drawable_layer layer;
