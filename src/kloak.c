@@ -21,10 +21,13 @@
 #include <wayland-client.h>
 #include "wlr-layer-shell.h"
 #include "wlr-virtual-pointer.h"
+#include "virtual-keyboard.h"
 
 #include <libinput.h>
 
 #include <libevdev/libevdev.h>
+
+#include <xkbcommon/xkbcommon.h>
 
 #include "kloak.h"
 
@@ -121,6 +124,14 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
   if (strcmp(interface, wl_compositor_interface.name) == 0) {
     state->compositor = wl_registry_bind(registry, name,
       &wl_compositor_interface, 5);
+  } else if (strcmp(interface, wl_seat_interface.name) == 0) {
+    if (!state->seat_set) {
+      state->seat = wl_registry_bind(registry, name, &wl_seat_interface, 9);
+      state->seat_set = true;
+    } else {
+      fprintf(stderr,
+        "WARNING: Multiple seats detected, all but first will be ignored.\n");
+    }
   } else if (strcmp(interface, wl_shm_interface.name) == 0) {
     state->shm = wl_registry_bind(registry, name, &wl_shm_interface, 2);
   } else if (strcmp(interface, wl_output_interface.name) == 0) {
@@ -132,11 +143,84 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
     strcmp(interface, zwlr_virtual_pointer_manager_v1_interface.name) == 0) {
     state->virt_pointer_manager = wl_registry_bind(registry, name,
       &zwlr_virtual_pointer_manager_v1_interface, 2);
+  } else if (
+    strcmp(interface, zwp_virtual_keyboard_manager_v1_interface.name) == 0) {
+    state->virt_kb_manager = wl_registry_bind(registry, name,
+      &zwp_virtual_keyboard_manager_v1_interface, 1);
   }
 }
 
 static void registry_handle_global_remove(void *data,
   struct wl_registry *registry, uint32_t name) {
+  ;
+}
+
+static void seat_handle_name(void *data, struct wl_seat *seat,
+  const char *name) {
+  struct disp_state *state = data;
+  state->seat_name = name;
+}
+
+static void seat_handle_capabilities(void *data, struct wl_seat *seat,
+  uint32_t capabilities) {
+  struct disp_state *state = data;
+  state->seat_caps = capabilities;
+  if (capabilities | WL_SEAT_CAPABILITY_KEYBOARD) {
+    state->kb = wl_seat_get_keyboard(seat);
+    wl_keyboard_add_listener(state->kb, &kb_listener, state);
+  } else {
+    fprintf(stderr,
+      "FATAL ERROR: No keyboard capability for seat, cannot continue.\n");
+    exit(1);
+  }
+}
+
+static void kb_handle_keymap(void *data, struct wl_keyboard *kb,
+  uint32_t format, int32_t fd, uint32_t size) {
+  struct disp_state *state = data;
+  zwp_virtual_keyboard_v1_keymap(state->virt_kb, format, fd, size);
+  char *kb_map_shm = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  /* TODO: I have no idea if any of these panics are right. Really the whole
+   * panic mechanism desperately needs reworked, it was designed to help with
+   * errno-based errors and that's really insufficient. */
+  if (kb_map_shm == MAP_FAILED)
+    panic("Could not mmap xkb layout!", -errno);
+  state->xkb_keymap = xkb_keymap_new_from_string(
+    state->xkb_ctx, kb_map_shm, XKB_KEYMAP_FORMAT_TEXT_V1,
+    XKB_KEYMAP_COMPILE_NO_FLAGS);
+  if (!state->xkb_keymap)
+    panic("Could not compile xkb layout!", -errno);
+  munmap(kb_map_shm, size);
+  close(fd);
+  state->xkb_state = xkb_state_new(state->xkb_keymap);
+  if (!state->xkb_state)
+    panic("Could not create xkb state!", -errno);
+  state->virt_kb_keymap_set = true;
+}
+
+static void kb_handle_enter(void *data, struct wl_keyboard *kb,
+  uint32_t serial, struct wl_surface *surface, struct wl_array *keys) {
+  wl_array_release(keys);
+}
+
+static void kb_handle_leave(void *data, struct wl_keyboard *kb,
+  uint32_t serial, struct wl_surface *surface) {
+  ;
+}
+
+static void kb_handle_key(void *data, struct wl_keyboard *kb,
+  uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
+  ;
+}
+
+static void kb_handle_modifiers(void *data, struct wl_keyboard *kb,
+  uint32_t serial, uint32_t mods_depressed, uint32_t mods_latched,
+  uint32_t mods_locked, uint32_t group) {
+  ;
+}
+
+static void kb_handle_repeat_info(void *data, struct wl_keyboard *kb,
+  int32_t rate, int32_t delay) {
   ;
 }
 
@@ -187,12 +271,10 @@ static int li_open_restricted(const char *path, int flags, void *user_data) {
     exit(1);
   }
   const char *dev_name = libevdev_get_name(evdev_dev);
-  if (strstr(dev_name, "keyboard") == NULL) {
-    int one = 1;
-    if (ioctl(fd, EVIOCGRAB, &one) < 0) {
-      fprintf(stderr, "FATAL ERROR: Could not grab evdev device '%s'!\n", path);
-      exit(1);
-    }
+  int one = 1;
+  if (ioctl(fd, EVIOCGRAB, &one) < 0) {
+    fprintf(stderr, "FATAL ERROR: Could not grab evdev device '%s'!\n", path);
+    exit(1);
   }
   printf("%s\n", dev_name);
   li_fds[li_fd_count] = fd;
@@ -267,9 +349,17 @@ static void allocate_drawable_layer(struct disp_state *state,
     state->virt_pointer_manager, NULL, layer->output);
 }
 
-static void update_virtual_cursor(enum libinput_event_type ev_type) {
+static void handle_libinput_event(enum libinput_event_type ev_type) {
+  bool mouse_event_handled = false;
+
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  unsigned int ts_milliseconds = ts.tv_sec * 1000;
+  ts_milliseconds += (ts.tv_nsec / 1000000);
+
   struct libinput_event *li_event = libinput_get_event(li);
   if (ev_type == LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE) {
+    mouse_event_handled = true;
     struct libinput_event_pointer *pointer_event
       = libinput_event_get_pointer_event(li_event);
     double abs_x = libinput_event_pointer_get_absolute_x_transformed(
@@ -279,7 +369,12 @@ static void update_virtual_cursor(enum libinput_event_type ev_type) {
     crosshair_x = abs_x;
     crosshair_y = abs_y;
     frame_pending = true;
+    zwlr_virtual_pointer_v1_motion_absolute(state.layer.virt_pointer,
+      ts_milliseconds, (unsigned int) crosshair_x, (unsigned int) crosshair_y,
+      state.layer.width, state.layer.height);
+
   } else if (ev_type == LIBINPUT_EVENT_POINTER_MOTION) {
+    mouse_event_handled = true;
     struct libinput_event_pointer *pointer_event
       = libinput_event_get_pointer_event(li_event);
     double rel_x = libinput_event_pointer_get_dx(pointer_event);
@@ -291,16 +386,108 @@ static void update_virtual_cursor(enum libinput_event_type ev_type) {
     if (crosshair_x > state.layer.width) crosshair_x = state.layer.width;
     if (crosshair_y > state.layer.height) crosshair_y = state.layer.height;
     frame_pending = true;
+    zwlr_virtual_pointer_v1_motion_absolute(state.layer.virt_pointer,
+      ts_milliseconds, (unsigned int) crosshair_x, (unsigned int) crosshair_y,
+      state.layer.width, state.layer.height);
+
+  } else if (ev_type == LIBINPUT_EVENT_POINTER_BUTTON) {
+    mouse_event_handled = true;
+    struct libinput_event_pointer *pointer_event
+      = libinput_event_get_pointer_event(li_event);
+    uint32_t button_code = libinput_event_pointer_get_button(pointer_event);
+    enum libinput_button_state button_state
+      = libinput_event_pointer_get_button_state(pointer_event);
+    if (button_state == LIBINPUT_BUTTON_STATE_PRESSED) {
+      /* Both libinput and zwlr_virtual_pointer_v1 use evdev devent codes to
+       * identify the button pressed, so we can just pass the data from
+       * libinput straight through */
+      zwlr_virtual_pointer_v1_button(state.layer.virt_pointer,
+        ts_milliseconds, button_code, WL_POINTER_BUTTON_STATE_PRESSED);
+    } else {
+      zwlr_virtual_pointer_v1_button(state.layer.virt_pointer,
+        ts_milliseconds, button_code, WL_POINTER_BUTTON_STATE_RELEASED);
+    }
+
+  } else if (ev_type == LIBINPUT_EVENT_POINTER_SCROLL_WHEEL
+    || ev_type == LIBINPUT_EVENT_POINTER_SCROLL_FINGER
+    || ev_type == LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS) {
+    mouse_event_handled = true;
+    struct libinput_event_pointer *pointer_event
+      = libinput_event_get_pointer_event(li_event);
+    int vert_scroll_present = libinput_event_pointer_has_axis(pointer_event,
+      LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL);
+    int horiz_scroll_present = libinput_event_pointer_has_axis(pointer_event,
+      LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL);
+    if (vert_scroll_present) {
+      double vert_scroll_value = libinput_event_pointer_get_scroll_value(
+        pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL);
+      if (vert_scroll_value == 0) {
+        zwlr_virtual_pointer_v1_axis_stop(state.layer.virt_pointer,
+          ts_milliseconds, WL_POINTER_AXIS_VERTICAL_SCROLL);
+      } else {
+        zwlr_virtual_pointer_v1_axis(state.layer.virt_pointer,
+          ts_milliseconds, WL_POINTER_AXIS_VERTICAL_SCROLL,
+          wl_fixed_from_double(vert_scroll_value));
+      }
+      switch (ev_type) {
+        case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
+          zwlr_virtual_pointer_v1_axis_source(state.layer.virt_pointer,
+            WL_POINTER_AXIS_SOURCE_WHEEL);
+          break;
+        case LIBINPUT_EVENT_POINTER_SCROLL_FINGER:
+          zwlr_virtual_pointer_v1_axis_source(state.layer.virt_pointer,
+            WL_POINTER_AXIS_SOURCE_FINGER);
+          break;
+        case LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS:
+          zwlr_virtual_pointer_v1_axis_source(state.layer.virt_pointer,
+            WL_POINTER_AXIS_SOURCE_CONTINUOUS);
+          break;
+      }
+    }
+
+    if (horiz_scroll_present) {
+      double horiz_scroll_value = libinput_event_pointer_get_scroll_value(
+        pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL);
+      if (horiz_scroll_value == 0) {
+        zwlr_virtual_pointer_v1_axis_stop(state.layer.virt_pointer,
+          ts_milliseconds, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
+      } else {
+        zwlr_virtual_pointer_v1_axis(state.layer.virt_pointer,
+          ts_milliseconds, WL_POINTER_AXIS_HORIZONTAL_SCROLL,
+          wl_fixed_from_double(horiz_scroll_value));
+      }
+      switch (ev_type) {
+        case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
+          zwlr_virtual_pointer_v1_axis_source(state.layer.virt_pointer,
+            WL_POINTER_AXIS_SOURCE_WHEEL);
+          break;
+        case LIBINPUT_EVENT_POINTER_SCROLL_FINGER:
+          zwlr_virtual_pointer_v1_axis_source(state.layer.virt_pointer,
+            WL_POINTER_AXIS_SOURCE_FINGER);
+          break;
+        case LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS:
+          zwlr_virtual_pointer_v1_axis_source(state.layer.virt_pointer,
+            WL_POINTER_AXIS_SOURCE_CONTINUOUS);
+          break;
+      }
+    }
+
+  } else if (ev_type == LIBINPUT_EVENT_KEYBOARD_KEY) {
+    if (state.virt_kb_keymap_set) {
+      struct libinput_event_keyboard *kb_event
+        = libinput_event_get_keyboard_event(li_event);
+      uint32_t key = libinput_event_keyboard_get_key(kb_event);
+      enum libinput_key_state key_state
+        = libinput_event_keyboard_get_key_state(kb_event);
+      zwp_virtual_keyboard_v1_key(state.virt_kb, ts_milliseconds, key,
+        key_state);
+    }
+  }
+
+  if (mouse_event_handled) {
+    zwlr_virtual_pointer_v1_frame(state.layer.virt_pointer);
   }
   libinput_event_destroy(li_event);
-
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  unsigned int ts_milliseconds = ts.tv_sec * 1000;
-  ts_milliseconds += (ts.tv_nsec / 1000000);
-  zwlr_virtual_pointer_v1_motion_absolute(state.layer.virt_pointer,
-    ts_milliseconds, (unsigned int) crosshair_x, (unsigned int) crosshair_y,
-    state.layer.width, state.layer.height);
 }
 
 /****************************/
@@ -308,6 +495,9 @@ static void update_virtual_cursor(enum libinput_event_type ev_type) {
 /****************************/
 
 static void applayer_wayland_init() {
+  /* Technically we also initialize xkbcommon in here but it's only involved
+   * because it turned out to be important for sending key events to
+   * Wayland. */
   state.display = wl_display_connect(NULL);
   if (!state.display)
     panic("Could not get Wayland display", errno);
@@ -322,6 +512,24 @@ static void applayer_wayland_init() {
   /* At this point, the shm, compositor, and wm_base objects will be
    * allocated by registry global handler. */
 
+  state.virt_kb = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(
+    state.virt_kb_manager, state.seat);
+  /* The virtual-keyboard-v1 protocol returns 0 when making a new virtual
+   * keyboard if kloak is unauthorized to create a virtual keyboard. However,
+   * the protocol treats this as an enum value, meaning... we have to compare
+   * a pointer to an enum. This is horrible and the protocol really shouldn't
+   * require this, but it does, so... */
+  if ((uint64_t)state.virt_kb
+    == ZWP_VIRTUAL_KEYBOARD_MANAGER_V1_ERROR_UNAUTHORIZED) {
+    fprintf(stderr,
+      "Not authorized to create a virtual keyboard! Bailing out.");
+    exit(1);
+  }
+  wl_seat_add_listener(state.seat, &seat_listener, &state);
+
+  state.xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+  if (!state.xkb_ctx)
+    panic("Could not create XKB context", -errno);
   allocate_drawable_layer(&state, &state.layer);
 }
 
@@ -379,7 +587,7 @@ int main(int argc, char **argv) {
       enum libinput_event_type next_ev_type = libinput_next_event_type(li);
       if (next_ev_type == LIBINPUT_EVENT_NONE)
         break;
-      update_virtual_cursor(next_ev_type);
+      handle_libinput_event(next_ev_type);
     }
 
     if (frame_pending)
