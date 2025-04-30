@@ -49,6 +49,8 @@ struct disp_state {
   struct xkb_context *xkb_ctx;
   struct xkb_keymap *xkb_keymap;
   struct xkb_state *xkb_state;
+  char *old_kb_map_shm;
+  uint32_t old_kb_map_shm_size;
 
   /* window and buffer properties */
   struct drawable_layer layer;

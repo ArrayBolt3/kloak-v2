@@ -52,21 +52,23 @@ struct pollfd *ev_fds;
 /* utility functions */
 /*********************/
 
-static void panic(const char *errmsg, int err_no) {
-  printf("FATAL ERROR: %s: %s\n", errmsg, strerror(-err_no));
-  exit(1);
-}
-
 static void randname(char *buf, size_t len) {
   int randfd = open("/dev/urandom", O_RDONLY);
-  if (randfd < 0)
-    panic("Could not open /dev/urandom", errno);
+  if (randfd < 0) {
+    fprintf(stderr, "FATAL ERROR: Could not open /dev/urandom: %s\n",
+      strerror(errno));
+    exit(1);
+  }
 
   char randchar = 0;
   for (size_t i = 0; i < len; ++i) {
     do {
-      if (read(randfd, &randchar, 1) < 1)
-        panic("Could not read byte from /dev/urandom", errno);
+      if (read(randfd, &randchar, 1) < 1) {
+        fprintf(stderr,
+          "FATAL ERROR: Could not read byte from /dev/urandom: %s\n",
+          strerror(errno));
+        exit(1);
+      }
       if (randchar & 0x80)
         randchar ^= 0x80;
     } while (randchar >= (127 - 127 % 52));
@@ -80,8 +82,11 @@ static void randname(char *buf, size_t len) {
     buf[i] = randchar;
   }
 
-  if (close(randfd) == -1)
-    panic("Could not close /dev/urandom", errno);
+  if (close(randfd) == -1) {
+    fprintf(stderr, "FATAL ERROR: Could not close /dev/urandom: %s\n",
+      strerror(errno));
+    exit(1);
+  }
 }
 
 static int create_shm_file(size_t size)
@@ -99,8 +104,11 @@ static int create_shm_file(size_t size)
     }
   } while (retries > 0 && errno == EEXIST);
 
-  if (fd == -1)
-    panic("Could not create shared memory fd", -EAGAIN);
+  if (fd == -1) {
+    fprintf(stderr,
+      "FATAL ERROR: Could not create shared memory fd: Resource temporarily unavailable\n");
+    exit(1);
+  }
 
   int ret;
   do {
@@ -108,7 +116,10 @@ static int create_shm_file(size_t size)
   } while (ret < 0 && errno == EINTR);
   if (ret < 0) {
     close(fd);
-    panic("Could not allocate shared memory block", -errno);
+    fprintf(stderr,
+      "FATAL ERROR: Could not allocate shared memory block: %s\n",
+      strerror(errno));
+    exit(1);
   }
 
   return fd;
@@ -178,23 +189,44 @@ static void seat_handle_capabilities(void *data, struct wl_seat *seat,
 static void kb_handle_keymap(void *data, struct wl_keyboard *kb,
   uint32_t format, int32_t fd, uint32_t size) {
   struct disp_state *state = data;
-  zwp_virtual_keyboard_v1_keymap(state->virt_kb, format, fd, size);
   char *kb_map_shm = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
-  /* TODO: I have no idea if any of these panics are right. Really the whole
-   * panic mechanism desperately needs reworked, it was designed to help with
-   * errno-based errors and that's really insufficient. */
-  if (kb_map_shm == MAP_FAILED)
-    panic("Could not mmap xkb layout!", -errno);
+  if (kb_map_shm == MAP_FAILED) {
+    fprintf(stderr, "FATAL ERROR: Could not mmap xkb layout!");
+    exit(1);
+  }
+  if (state->old_kb_map_shm) {
+    printf("%d\n", strcmp(state->old_kb_map_shm, kb_map_shm));
+    if (strcmp(state->old_kb_map_shm, kb_map_shm) == 0) {
+      /* New and old maps are the same, cleanup and return. */
+      munmap(kb_map_shm, size);
+      close(fd);
+      return;
+    } else {
+      munmap(state->old_kb_map_shm, state->old_kb_map_shm_size);
+    }
+  }
+  zwp_virtual_keyboard_v1_keymap(state->virt_kb, format, fd, size);
+  state->old_kb_map_shm = kb_map_shm;
+  state->old_kb_map_shm_size = size;
+  if (state->xkb_keymap) {
+    free(state->xkb_keymap);
+  }
   state->xkb_keymap = xkb_keymap_new_from_string(
     state->xkb_ctx, kb_map_shm, XKB_KEYMAP_FORMAT_TEXT_V1,
     XKB_KEYMAP_COMPILE_NO_FLAGS);
-  if (!state->xkb_keymap)
-    panic("Could not compile xkb layout!", -errno);
-  munmap(kb_map_shm, size);
+  if (!state->xkb_keymap) {
+    fprintf(stderr, "FATAL ERROR: Could not compile xkb layout!");
+    exit(1);
+  }
   close(fd);
+  if (state->xkb_state) {
+    free(state->xkb_state);
+  }
   state->xkb_state = xkb_state_new(state->xkb_keymap);
-  if (!state->xkb_state)
-    panic("Could not create xkb state!", -errno);
+  if (!state->xkb_state) {
+    fprintf(stderr, "FATAL ERROR: Could not create xkb state!");
+    exit(1);
+  }
   state->virt_kb_keymap_set = true;
 }
 
@@ -238,13 +270,20 @@ static void layer_surface_configure(void *data,
   state->layer.stride = width * 4;
   state->layer.size = state->layer.stride * (size_t) height;
   int shm_fd = create_shm_file(state->layer.size);
-  if (shm_fd == -1)
-    panic("Cannot allocate shared memory block for frame", errno);
+  if (shm_fd == -1) {
+    fprintf(stderr,
+      "FATAL ERROR: Cannot allocate shared memory block for frame: %s\n",
+      strerror(errno));
+    exit(1);
+  }
   state->layer.pixbuf = mmap(NULL, state->layer.size, PROT_READ | PROT_WRITE,
     MAP_SHARED, shm_fd, 0);
   if (state->layer.pixbuf == MAP_FAILED) {
     close(shm_fd);
-    panic("Failed to map shared memory block for frame", errno);
+    fprintf(stderr,
+      "FATAL ERROR: Failed to map shared memory block for frame: %s\n",
+      strerror(errno));
+    exit(1);
   }
   state->layer.shm_pool = wl_shm_create_pool(state->shm, shm_fd,
     state->layer.size);
@@ -276,7 +315,6 @@ static int li_open_restricted(const char *path, int flags, void *user_data) {
     fprintf(stderr, "FATAL ERROR: Could not grab evdev device '%s'!\n", path);
     exit(1);
   }
-  printf("%s\n", dev_name);
   li_fds[li_fd_count] = fd;
   ++li_fd_count;
   return fd < 0 ? -errno : fd;
@@ -326,8 +364,10 @@ static void allocate_drawable_layer(struct disp_state *state,
   struct drawable_layer *layer) {
   layer->output = state->output;
   layer->surface = wl_compositor_create_surface(state->compositor);
-  if (!layer->surface)
-    panic("Could not create Wayland surface", errno);
+  if (!layer->surface) {
+    fprintf(stderr, "FATAL ERROR: Could not create Wayland surface!");
+    exit(1);
+  }
   layer->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
     state->layer_shell, layer->surface, layer->output,
     ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "com.kicksecure.kloak");
@@ -479,8 +519,25 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
       uint32_t key = libinput_event_keyboard_get_key(kb_event);
       enum libinput_key_state key_state
         = libinput_event_keyboard_get_key_state(kb_event);
+      xkb_mod_mask_t depressed_mods = xkb_state_serialize_mods(
+        state.xkb_state, XKB_STATE_MODS_DEPRESSED);
+      xkb_mod_mask_t latched_mods = xkb_state_serialize_mods(
+        state.xkb_state, XKB_STATE_MODS_LATCHED);
+      xkb_mod_mask_t locked_mods = xkb_state_serialize_mods(
+        state.xkb_state, XKB_STATE_MODS_LOCKED);
+      xkb_layout_index_t effective_group = xkb_state_serialize_layout(
+        state.xkb_state, XKB_STATE_LAYOUT_EFFECTIVE);
+      zwp_virtual_keyboard_v1_modifiers(state.virt_kb, depressed_mods,
+        latched_mods, locked_mods, effective_group);
       zwp_virtual_keyboard_v1_key(state.virt_kb, ts_milliseconds, key,
         key_state);
+      if (key_state == LIBINPUT_KEY_STATE_PRESSED) {
+        /* XKB keycodes == evdev keycodes + 8. Why this design decision was
+         * made, I have no idea. */
+        xkb_state_update_key(state.xkb_state, key + 8, XKB_KEY_DOWN);
+      } else {
+        xkb_state_update_key(state.xkb_state, key + 8, XKB_KEY_UP);
+      }
     }
   }
 
@@ -499,13 +556,17 @@ static void applayer_wayland_init() {
    * because it turned out to be important for sending key events to
    * Wayland. */
   state.display = wl_display_connect(NULL);
-  if (!state.display)
-    panic("Could not get Wayland display", errno);
+  if (!state.display) {
+    fprintf(stderr, "FATAL ERROR: Could not get Wayland display!");
+    exit(1);
+  }
   state.display_fd = wl_display_get_fd(state.display);
 
   state.registry = wl_display_get_registry(state.display);
-  if (!state.registry)
-    panic("Could not get Wayland registry", errno);
+  if (!state.registry) {
+    fprintf(stderr, "FATAL ERROR: Could not get Wayland registry!");
+    exit(1);
+  }
   wl_registry_add_listener(state.registry, &registry_listener, &state);
   wl_display_roundtrip(state.display);
 
@@ -528,16 +589,21 @@ static void applayer_wayland_init() {
   wl_seat_add_listener(state.seat, &seat_listener, &state);
 
   state.xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-  if (!state.xkb_ctx)
-    panic("Could not create XKB context", -errno);
+  if (!state.xkb_ctx) {
+    fprintf(stderr, "FATAL ERROR: Could not create XKB context!");
+    exit(1);
+  }
   allocate_drawable_layer(&state, &state.layer);
 }
 
 static void applayer_libinput_init() {
   li = libinput_path_create_context(&li_interface, NULL);
   DIR *dev_input_dir = opendir("/dev/input");
-  if (dev_input_dir == NULL)
-    panic("Could not open directory /dev/input", errno);
+  if (dev_input_dir == NULL) {
+    fprintf(stderr, "FATAL ERROR: Could not open directory /dev/input: %s\n",
+      strerror(errno));
+    exit(1);
+  }
   struct dirent *dev_input_entry;
 
   while ((dev_input_entry = readdir(dev_input_dir)) != NULL) {
