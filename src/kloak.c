@@ -3,6 +3,22 @@
  * See the file COPYING for copying conditions.
  */
 
+/*
+ * TODO:
+ * - Do we need to be freeing the const char *s sent to us by the server? We
+ *   do, don't we? Right now we're just leaking them all.
+ * - Technically we could have a situation where there is a gap between
+ *   outputs, part or all of a window is occupying that gap, the user's cursor
+ *   is in a scrollable or clickable part of that window (that they can't
+ *   see), and they try to scroll or click in that part of the window. With
+ *   the current implementation, these clicks and scrolls will be lost,
+ *   because kloak won't be able to determine which virtual pointer to send
+ *   the click events too. Is it possible to send click and scroll events to
+ *   *any* virtual pointer and have them work regardless of which pointer is
+ *   the technically right one to use? If so, we should do that to correct
+ *   this issue.
+ */
+
 #include <stdlib.h>
 #include <stdint.h>
 #include <errno.h>
@@ -19,6 +35,7 @@
 #include <time.h>
 
 #include <wayland-client.h>
+#include "xdg-output-protocol.h"
 #include "wlr-layer-shell.h"
 #include "wlr-virtual-pointer.h"
 #include "virtual-keyboard.h"
@@ -35,11 +52,10 @@
 /* global variables */
 /********************/
 
-double crosshair_x = 0;
-double crosshair_y = 0;
-
-bool frame_released = true;
-bool frame_pending = true;
+double cursor_x = 0;
+double cursor_y = 0;
+double prev_cursor_x = 0;
+double prev_cursor_y = 0;
 
 struct disp_state state = { 0 };
 struct libinput *li;
@@ -125,6 +141,95 @@ static int create_shm_file(size_t size)
   return fd;
 }
 
+static void recalc_global_space(struct disp_state * state) {
+  uint32_t ul_corner_x = UINT32_MAX;
+  uint32_t ul_corner_y = UINT32_MAX;
+  uint32_t br_corner_x = 0;
+  uint32_t br_corner_y = 0;
+
+  for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+    if (!state->output_geometry[i])
+      continue;
+    if (!state->output_geometry[i]->init_done)
+      continue;
+    if (state->output_geometry[i]->x < ul_corner_x) {
+      ul_corner_x = state->output_geometry[i]->x;
+    }
+    if (state->output_geometry[i]->y < ul_corner_y) {
+      ul_corner_y = state->output_geometry[i]->y;
+    }
+    uint32_t temp_br_x
+      = state->output_geometry[i]->x + state->output_geometry[i]->width;
+    uint32_t temp_br_y
+      = state->output_geometry[i]->y + state->output_geometry[i]->height;
+    if (temp_br_x > br_corner_x) {
+      br_corner_x = temp_br_x;
+    }
+    if (temp_br_y > br_corner_y) {
+      br_corner_y = temp_br_y;
+    }
+  }
+
+  if (ul_corner_x > br_corner_x) {
+    /* Maybe we just haven't gotten a valid screen state yet, silently fail */
+    return;
+  }
+  if (ul_corner_y > br_corner_y) {
+    /* same as above */
+    return;
+  }
+  if (ul_corner_x != 0 || ul_corner_y != 0) {
+    fprintf(stderr,
+      "WARNING: Upper left corner of global compositor space is not at (0,0), application will probably misbehave\n");
+    fprintf(stderr,
+      "Upper left corner X: %d\n", ul_corner_x);
+    fprintf(stderr,
+      "Upper left corner Y: %d\n", ul_corner_y);
+  }
+
+  state->global_space_width = br_corner_x - ul_corner_x;
+  state->global_space_height = br_corner_y - ul_corner_y;
+}
+
+static struct screen_local_coord abs_coord_to_screen_local_coord(uint32_t x,
+  uint32_t y) {
+  struct screen_local_coord out_data = { 0 };
+
+  for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+    if (!state.output_geometry[i]) {
+      continue;
+    }
+    if (!state.output_geometry[i]->init_done) {
+      continue;
+    }
+    if (!(x >= state.output_geometry[i]->x)) {
+      continue;
+    }
+    if (!(y >= state.output_geometry[i]->y)) {
+      continue;
+    }
+    if (!(x < state.output_geometry[i]->x
+      + state.output_geometry[i]->width)) {
+      continue;
+    }
+    if (!(y < state.output_geometry[i]->y
+      + state.output_geometry[i]->height)) {
+      continue;
+    }
+    out_data.output_idx = i;
+    out_data.x = x - state.output_geometry[i]->x;
+    out_data.y = y - state.output_geometry[i]->y;
+    out_data.valid = true;
+    break;
+  }
+
+  /* There is a possibility that out_data will contain all zeros; if this
+   * happens, it means that no output covered the requested coordinates in the
+   * compositor's global space. That's a valid thing to tell a caller, so just
+   * return it anyway. */
+  return out_data;
+}
+
 /********************/
 /* wayland handling */
 /********************/
@@ -146,7 +251,54 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
   } else if (strcmp(interface, wl_shm_interface.name) == 0) {
     state->shm = wl_registry_bind(registry, name, &wl_shm_interface, 2);
   } else if (strcmp(interface, wl_output_interface.name) == 0) {
-    state->output = wl_registry_bind(registry, name, &wl_output_interface, 4);
+    bool new_layer_allocated = false;
+    for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+      if (!state->layer[i]) {
+        state->output[i] = wl_registry_bind(registry, name,
+          &wl_output_interface, 4);
+        wl_output_add_listener(state->output[i], &output_listener, state);
+        state->layer[i] = malloc(sizeof(struct drawable_layer));
+        state->layer[i]->frame_released = true;
+        state->layer[i]->frame_pending = true;
+        allocate_drawable_layer(state, state->layer[i], state->output[i]);
+        if (state->xdg_output_manager) {
+          /* We can only create xdg_outputs for wl_outputs if we've received
+           * the zxdg_output_manager_v1 object from the server, thus the 'if'
+           * condition here. When we *do* get the zxdg_output_manager_v1
+           * object, we go through and make xdg_outputs for any wl_outputs
+           * that were sent too early. */
+          state->xdg_output[i] = zxdg_output_manager_v1_get_xdg_output(
+            state->xdg_output_manager, state->output[i]);
+          zxdg_output_v1_add_listener(state->xdg_output[i],
+            &xdg_output_listener, state);
+          state->output_geometry[i] = malloc(sizeof(struct output_geometry));
+        }
+        new_layer_allocated = true;
+        break;
+      }
+    }
+    if (!new_layer_allocated) {
+      fprintf(stderr,
+        "FATAL ERROR: Cannot handle more than %d displays attached at once!",
+        MAX_DRAWABLE_LAYERS);
+      exit(1);
+    }
+  } else if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0) {
+    state->xdg_output_manager = wl_registry_bind(registry, name,
+      &zxdg_output_manager_v1_interface, 3);
+    for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+      if (state->output[i]) {
+        if (!state->xdg_output[i]) {
+          /* This is where we make xdg_outputs for any wl_outputs that were
+           * sent too early. */
+          state->xdg_output[i] = zxdg_output_manager_v1_get_xdg_output(
+            state->xdg_output_manager, state->output[i]);
+          zxdg_output_v1_add_listener(state->xdg_output[i],
+            &xdg_output_listener, state);
+          state->output_geometry[i] = malloc(sizeof(struct output_geometry));
+        }
+      }
+    }
   } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
     state->layer_shell = wl_registry_bind(registry, name,
       &zwlr_layer_shell_v1_interface, 4);
@@ -163,7 +315,31 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
 
 static void registry_handle_global_remove(void *data,
   struct wl_registry *registry, uint32_t name) {
-  ;
+  struct disp_state *state = data;
+  for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+    if (state->layer[i]) {
+      if (wl_proxy_get_id((struct wl_proxy *) state->output[i]) == name) {
+        struct drawable_layer *layer = state->layer[i];
+        wl_output_release(state->output[i]);
+        zxdg_output_v1_destroy(state->xdg_output[i]);
+        free(state->output_geometry[i]);
+        state->output[i] = NULL;
+        wl_surface_destroy(layer->surface);
+        zwlr_layer_surface_v1_destroy(layer->layer_surface);
+        zwlr_virtual_pointer_v1_destroy(layer->virt_pointer);
+        if (layer->pixbuf != NULL) {
+          munmap(layer->pixbuf, layer->size);
+        }
+        if (layer->shm_pool != NULL) {
+          wl_shm_pool_destroy(layer->shm_pool);
+        }
+        free(layer);
+        state->layer[i] = NULL;
+        recalc_global_space(state);
+        break;
+      }
+    }
+  }
 }
 
 static void seat_handle_name(void *data, struct wl_seat *seat,
@@ -195,7 +371,6 @@ static void kb_handle_keymap(void *data, struct wl_keyboard *kb,
     exit(1);
   }
   if (state->old_kb_map_shm) {
-    printf("%d\n", strcmp(state->old_kb_map_shm, kb_map_shm));
     if (strcmp(state->old_kb_map_shm, kb_map_shm) == 0) {
       /* New and old maps are the same, cleanup and return. */
       munmap(kb_map_shm, size);
@@ -257,44 +432,138 @@ static void kb_handle_repeat_info(void *data, struct wl_keyboard *kb,
 }
 
 static void wl_buffer_release(void *data, struct wl_buffer *buffer) {
+  for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+    if (state.layer[i]) {
+      if (state.layer[i]->buffer == buffer) {
+        state.layer[i]->frame_released = true;
+        state.layer[i]->buffer = NULL;
+        break;
+      }
+    }
+  }
   wl_buffer_destroy(buffer);
-  frame_released = true;
+}
+
+static void xdg_output_handle_logical_position(void *data,
+  struct zxdg_output_v1 *xdg_output, int32_t x, int32_t y) {
+  struct disp_state *state = data;
+  for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+    if (state->xdg_output[i] == xdg_output) {
+      state->output_geometry[i]->x = x;
+      state->output_geometry[i]->y = y;
+      break;
+    }
+  }
+}
+
+static void xdg_output_handle_logical_size(void *data,
+  struct zxdg_output_v1 *xdg_output, int32_t width, int32_t height) {
+  struct disp_state *state = data;
+  for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+    if (state->xdg_output[i] == xdg_output) {
+      state->output_geometry[i]->width = width;
+      state->output_geometry[i]->height = height;
+      break;
+    }
+  }
+}
+
+static void wl_output_handle_geometry(void *data, struct wl_output *output,
+  int32_t x, int32_t y, int32_t physical_width, int32_t physical_height,
+  int32_t subpixel, const char *make, const char *model, int32_t transform) {
+  ;
+}
+
+static void wl_output_handle_mode(void *data, struct wl_output *output,
+  uint32_t flags, int32_t width, int32_t height, int32_t refresh) {
+  ;
+}
+
+static void wl_output_info_done(void *data, struct wl_output *output) {
+  struct disp_state *state = data;
+  for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+    if (state->output[i] == output) {
+      state->output_geometry[i]->init_done = true;
+      recalc_global_space(state);
+      break;
+    }
+  }
+}
+
+static void wl_output_handle_scale(void *data, struct wl_output *output,
+  int32_t factor) {
+  ;
+}
+
+static void wl_output_handle_name(void *data, struct wl_output *output,
+  const char *name) {
+  ;
+}
+
+static void wl_output_handle_description(void *data, struct wl_output *output,
+  const char *description) {
+  ;
+}
+
+static void xdg_output_info_done(void *data,
+  struct zxdg_output_v1 *xdg_output) {
+  ;
+}
+
+static void xdg_output_handle_name(void *data,
+  struct zxdg_output_v1 *xdg_output, const char *name) {
+  ;
+}
+
+static void xdg_output_handle_description(void *data,
+  struct zxdg_output_v1 *xdg_output, const char *description) {
+  ;
 }
 
 static void layer_surface_configure(void *data,
   struct zwlr_layer_surface_v1 *layer_surface, uint32_t serial, uint32_t width,
   uint32_t height) {
   struct disp_state *state = data;
-  state->layer.width = width;
-  state->layer.height = height;
-  state->layer.stride = width * 4;
-  state->layer.size = state->layer.stride * (size_t) height;
-  int shm_fd = create_shm_file(state->layer.size);
+  struct drawable_layer *layer;
+  for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+    if (state->layer[i]) {
+      if (state->layer[i]->layer_surface == layer_surface) {
+        layer = state->layer[i];
+        break;
+      }
+    }
+  }
+  layer->width = width;
+  layer->height = height;
+  layer->stride = width * 4;
+  layer->size = layer->stride * (size_t) height;
+  int shm_fd = create_shm_file(layer->size);
   if (shm_fd == -1) {
     fprintf(stderr,
       "FATAL ERROR: Cannot allocate shared memory block for frame: %s\n",
       strerror(errno));
     exit(1);
   }
-  state->layer.pixbuf = mmap(NULL, state->layer.size, PROT_READ | PROT_WRITE,
+  layer->pixbuf = mmap(NULL, layer->size, PROT_READ | PROT_WRITE,
     MAP_SHARED, shm_fd, 0);
-  if (state->layer.pixbuf == MAP_FAILED) {
+  if (layer->pixbuf == MAP_FAILED) {
     close(shm_fd);
     fprintf(stderr,
       "FATAL ERROR: Failed to map shared memory block for frame: %s\n",
       strerror(errno));
     exit(1);
   }
-  state->layer.shm_pool = wl_shm_create_pool(state->shm, shm_fd,
-    state->layer.size);
+  layer->shm_pool = wl_shm_create_pool(state->shm, shm_fd,
+    layer->size);
 
   struct wl_region *zeroed_region = wl_compositor_create_region(state->compositor);
   wl_region_add(zeroed_region, 0, 0, 0, 0);
-  wl_surface_set_input_region(state->layer.surface, zeroed_region);
+  wl_surface_set_input_region(layer->surface, zeroed_region);
 
   zwlr_layer_surface_v1_ack_configure(layer_surface, serial);
-  state->layer.layer_surface_configured = true;
-  draw_frame(state);
+  layer->layer_surface_configured = true;
+  wl_region_destroy(zeroed_region);
+  draw_frame(layer);
 }
 
 /*********************/
@@ -328,41 +597,40 @@ static void li_close_restricted(int fd, void *user_data) {
 /* high-level functions */
 /************************/
 
-static void draw_frame(struct disp_state *state) {
-  if (!frame_released)
+static void draw_frame(struct drawable_layer *layer) {
+  if (!layer->frame_released)
     return;
-  if (!state->layer.layer_surface_configured)
+  if (!layer->layer_surface_configured)
     return;
-  frame_pending = false;
+  layer->frame_pending = false;
 
-  struct wl_buffer *buffer = wl_shm_pool_create_buffer(state->layer.shm_pool,
-    0, state->layer.width,
-    state->layer.height, state->layer.stride, WL_SHM_FORMAT_ARGB8888);
+  struct wl_buffer *buffer = wl_shm_pool_create_buffer(layer->shm_pool,
+    0, layer->width,
+    layer->height, layer->stride, WL_SHM_FORMAT_ARGB8888);
 
   /* Draw a red line in the middle of the buffer */
-  for (int y = 0; y < state->layer.height; ++y) {
-    for (int x = 0; x < state->layer.width; ++x) {
-      if (x == (int) crosshair_x)
-        state->layer.pixbuf[y * state->layer.width + x] = 0xffff0000;
-      else if (y == (int) crosshair_y)
-        state->layer.pixbuf[y * state->layer.width + x] = 0xffff0000;
+  for (int y = 0; y < layer->height; ++y) {
+    for (int x = 0; x < layer->width; ++x) {
+      if (x == (int) cursor_x)
+        layer->pixbuf[y * layer->width + x] = 0xffff0000;
+      else if (y == (int) cursor_y)
+        layer->pixbuf[y * layer->width + x] = 0xffff0000;
       else
-        state->layer.pixbuf[y * state->layer.width + x] = 0x00000000;
+        layer->pixbuf[y * layer->width + x] = 0x00000000;
     }
   }
 
   wl_buffer_add_listener(buffer, &buffer_listener, NULL);
-  wl_surface_attach(state->layer.surface, buffer, 0, 0);
-  wl_surface_damage_buffer(state->layer.surface, 0, 0, INT32_MAX, INT32_MAX);
-  wl_surface_commit(state->layer.surface);
-  frame_released = false;
+  layer->buffer = buffer;
+  wl_surface_attach(layer->surface, buffer, 0, 0);
+  wl_surface_damage_buffer(layer->surface, 0, 0, INT32_MAX, INT32_MAX);
+  wl_surface_commit(layer->surface);
+  layer->frame_released = false;
 }
 
-/*static void allocate_drawable_layer(struct disp_state *state,
-  struct drawable_layer *layer, int layer_width, int layer_height) {*/
 static void allocate_drawable_layer(struct disp_state *state,
-  struct drawable_layer *layer) {
-  layer->output = state->output;
+  struct drawable_layer *layer, struct wl_output *output) {
+  layer->output = output;
   layer->surface = wl_compositor_create_surface(state->compositor);
   if (!layer->surface) {
     fprintf(stderr, "FATAL ERROR: Could not create Wayland surface!");
@@ -389,6 +657,31 @@ static void allocate_drawable_layer(struct disp_state *state,
     state->virt_pointer_manager, NULL, layer->output);
 }
 
+static void update_virtual_cursor(struct screen_local_coord prev_coord_data,
+  struct screen_local_coord coord_data, unsigned int ts_milliseconds) {
+  if (prev_coord_data.valid) {
+    if (!state.layer[prev_coord_data.output_idx]) {
+      fprintf(stderr,
+        "FATAL ERROR: Previous coordinate data points to an unallocated drawable layer!\n");
+      exit(1);
+    }
+    state.layer[prev_coord_data.output_idx]->frame_pending = true;
+  }
+  if (coord_data.valid) {
+    if (!state.layer[coord_data.output_idx]) {
+      fprintf(stderr,
+        "FATAL ERROR: Current coordinate data points to an unallocated drawable layer!\n");
+      exit(1);
+    }
+    state.layer[coord_data.output_idx]->frame_pending = true;
+    zwlr_virtual_pointer_v1_motion_absolute(
+      state.layer[coord_data.output_idx]->virt_pointer,
+      ts_milliseconds, (uint32_t) coord_data.x, (uint32_t) coord_data.y,
+      state.layer[coord_data.output_idx]->width,
+      state.layer[coord_data.output_idx]->height);
+  }
+}
+
 static void handle_libinput_event(enum libinput_event_type ev_type) {
   bool mouse_event_handled = false;
 
@@ -397,21 +690,34 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
   unsigned int ts_milliseconds = ts.tv_sec * 1000;
   ts_milliseconds += (ts.tv_nsec / 1000000);
 
+  struct screen_local_coord prev_coord_data = { 0 };
+  struct screen_local_coord coord_data = { 0 };
   struct libinput_event *li_event = libinput_get_event(li);
+
+  if (ev_type != LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE
+    && ev_type != LIBINPUT_EVENT_POINTER_MOTION) {
+    /* prev_coord_data is only needed for motion events, which have to
+     * generate it after updating cursor data anyway, so we don't need to
+     * generate it here. */
+    coord_data = abs_coord_to_screen_local_coord(cursor_x, cursor_y);
+  }
+
   if (ev_type == LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE) {
     mouse_event_handled = true;
     struct libinput_event_pointer *pointer_event
       = libinput_event_get_pointer_event(li_event);
     double abs_x = libinput_event_pointer_get_absolute_x_transformed(
-      pointer_event, state.layer.width);
+      pointer_event, state.global_space_width);
     double abs_y = libinput_event_pointer_get_absolute_y_transformed(
-      pointer_event, state.layer.height);
-    crosshair_x = abs_x;
-    crosshair_y = abs_y;
-    frame_pending = true;
-    zwlr_virtual_pointer_v1_motion_absolute(state.layer.virt_pointer,
-      ts_milliseconds, (unsigned int) crosshair_x, (unsigned int) crosshair_y,
-      state.layer.width, state.layer.height);
+      pointer_event, state.global_space_height);
+    prev_cursor_x = cursor_x;
+    prev_cursor_y = cursor_y;
+    cursor_x = abs_x;
+    cursor_y = abs_y;
+    prev_coord_data = abs_coord_to_screen_local_coord(prev_cursor_x,
+      prev_cursor_y);
+    coord_data = abs_coord_to_screen_local_coord(cursor_x, cursor_y);
+    update_virtual_cursor(prev_coord_data, coord_data, ts_milliseconds);
 
   } else if (ev_type == LIBINPUT_EVENT_POINTER_MOTION) {
     mouse_event_handled = true;
@@ -419,16 +725,18 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
       = libinput_event_get_pointer_event(li_event);
     double rel_x = libinput_event_pointer_get_dx(pointer_event);
     double rel_y = libinput_event_pointer_get_dy(pointer_event);
-    crosshair_x += rel_x;
-    crosshair_y += rel_y;
-    if (crosshair_x < 0) crosshair_x = 0;
-    if (crosshair_y < 0) crosshair_y = 0;
-    if (crosshair_x > state.layer.width) crosshair_x = state.layer.width;
-    if (crosshair_y > state.layer.height) crosshair_y = state.layer.height;
-    frame_pending = true;
-    zwlr_virtual_pointer_v1_motion_absolute(state.layer.virt_pointer,
-      ts_milliseconds, (unsigned int) crosshair_x, (unsigned int) crosshair_y,
-      state.layer.width, state.layer.height);
+    cursor_x += rel_x;
+    cursor_y += rel_y;
+    if (cursor_x < 0) cursor_x = 0;
+    if (cursor_y < 0) cursor_y = 0;
+    if (cursor_x > state.global_space_width)
+      cursor_x = state.global_space_width;
+    if (cursor_y > state.global_space_height)
+      cursor_y = state.global_space_height;
+    prev_coord_data = abs_coord_to_screen_local_coord(prev_cursor_x,
+      prev_cursor_y);
+    coord_data = abs_coord_to_screen_local_coord(cursor_x, cursor_y);
+    update_virtual_cursor(prev_coord_data, coord_data, ts_milliseconds);
 
   } else if (ev_type == LIBINPUT_EVENT_POINTER_BUTTON) {
     mouse_event_handled = true;
@@ -437,15 +745,24 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
     uint32_t button_code = libinput_event_pointer_get_button(pointer_event);
     enum libinput_button_state button_state
       = libinput_event_pointer_get_button_state(pointer_event);
-    if (button_state == LIBINPUT_BUTTON_STATE_PRESSED) {
-      /* Both libinput and zwlr_virtual_pointer_v1 use evdev devent codes to
-       * identify the button pressed, so we can just pass the data from
-       * libinput straight through */
-      zwlr_virtual_pointer_v1_button(state.layer.virt_pointer,
-        ts_milliseconds, button_code, WL_POINTER_BUTTON_STATE_PRESSED);
-    } else {
-      zwlr_virtual_pointer_v1_button(state.layer.virt_pointer,
-        ts_milliseconds, button_code, WL_POINTER_BUTTON_STATE_RELEASED);
+    if (coord_data.valid) {
+      if (!state.layer[coord_data.output_idx]) {
+        fprintf(stderr,
+          "FATAL ERROR: Current coordinate data points to an unallocated drawable layer!\n");
+        exit(1);
+      }
+      if (button_state == LIBINPUT_BUTTON_STATE_PRESSED) {
+        /* Both libinput and zwlr_virtual_pointer_v1 use evdev devent codes to
+         * identify the button pressed, so we can just pass the data from
+         * libinput straight through */
+        zwlr_virtual_pointer_v1_button(
+          state.layer[coord_data.output_idx]->virt_pointer,
+          ts_milliseconds, button_code, WL_POINTER_BUTTON_STATE_PRESSED);
+      } else {
+        zwlr_virtual_pointer_v1_button(
+          state.layer[coord_data.output_idx]->virt_pointer,
+          ts_milliseconds, button_code, WL_POINTER_BUTTON_STATE_RELEASED);
+      }
     }
 
   } else if (ev_type == LIBINPUT_EVENT_POINTER_SCROLL_WHEEL
@@ -458,57 +775,75 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
       LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL);
     int horiz_scroll_present = libinput_event_pointer_has_axis(pointer_event,
       LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL);
-    if (vert_scroll_present) {
-      double vert_scroll_value = libinput_event_pointer_get_scroll_value(
-        pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL);
-      if (vert_scroll_value == 0) {
-        zwlr_virtual_pointer_v1_axis_stop(state.layer.virt_pointer,
-          ts_milliseconds, WL_POINTER_AXIS_VERTICAL_SCROLL);
-      } else {
-        zwlr_virtual_pointer_v1_axis(state.layer.virt_pointer,
-          ts_milliseconds, WL_POINTER_AXIS_VERTICAL_SCROLL,
-          wl_fixed_from_double(vert_scroll_value));
+    if (coord_data.valid) {
+      if (!state.layer[coord_data.output_idx]) {
+        fprintf(stderr,
+          "FATAL ERROR: Current coordinate data points to an unallocated drawable layer!\n");
+        exit(1);
       }
-      switch (ev_type) {
-        case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
-          zwlr_virtual_pointer_v1_axis_source(state.layer.virt_pointer,
-            WL_POINTER_AXIS_SOURCE_WHEEL);
-          break;
-        case LIBINPUT_EVENT_POINTER_SCROLL_FINGER:
-          zwlr_virtual_pointer_v1_axis_source(state.layer.virt_pointer,
-            WL_POINTER_AXIS_SOURCE_FINGER);
-          break;
-        case LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS:
-          zwlr_virtual_pointer_v1_axis_source(state.layer.virt_pointer,
-            WL_POINTER_AXIS_SOURCE_CONTINUOUS);
-          break;
-      }
-    }
 
-    if (horiz_scroll_present) {
-      double horiz_scroll_value = libinput_event_pointer_get_scroll_value(
-        pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL);
-      if (horiz_scroll_value == 0) {
-        zwlr_virtual_pointer_v1_axis_stop(state.layer.virt_pointer,
-          ts_milliseconds, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
-      } else {
-        zwlr_virtual_pointer_v1_axis(state.layer.virt_pointer,
-          ts_milliseconds, WL_POINTER_AXIS_HORIZONTAL_SCROLL,
-          wl_fixed_from_double(horiz_scroll_value));
+      if (vert_scroll_present) {
+        double vert_scroll_value = libinput_event_pointer_get_scroll_value(
+          pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL);
+        if (vert_scroll_value == 0) {
+          zwlr_virtual_pointer_v1_axis_stop(
+            state.layer[coord_data.output_idx]->virt_pointer,
+            ts_milliseconds, WL_POINTER_AXIS_VERTICAL_SCROLL);
+        } else {
+          zwlr_virtual_pointer_v1_axis(
+            state.layer[coord_data.output_idx]->virt_pointer,
+            ts_milliseconds, WL_POINTER_AXIS_VERTICAL_SCROLL,
+            wl_fixed_from_double(vert_scroll_value));
+        }
+        switch (ev_type) {
+          case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
+            zwlr_virtual_pointer_v1_axis_source(
+              state.layer[coord_data.output_idx]->virt_pointer,
+              WL_POINTER_AXIS_SOURCE_WHEEL);
+            break;
+          case LIBINPUT_EVENT_POINTER_SCROLL_FINGER:
+            zwlr_virtual_pointer_v1_axis_source(
+              state.layer[coord_data.output_idx]->virt_pointer,
+              WL_POINTER_AXIS_SOURCE_FINGER);
+            break;
+          case LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS:
+            zwlr_virtual_pointer_v1_axis_source(
+              state.layer[coord_data.output_idx]->virt_pointer,
+              WL_POINTER_AXIS_SOURCE_CONTINUOUS);
+            break;
+        }
       }
-      switch (ev_type) {
-        case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
-          zwlr_virtual_pointer_v1_axis_source(state.layer.virt_pointer,
-            WL_POINTER_AXIS_SOURCE_WHEEL);
-          break;
-        case LIBINPUT_EVENT_POINTER_SCROLL_FINGER:
-          zwlr_virtual_pointer_v1_axis_source(state.layer.virt_pointer,
-            WL_POINTER_AXIS_SOURCE_FINGER);
-          break;
-        case LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS:
-          zwlr_virtual_pointer_v1_axis_source(state.layer.virt_pointer,
-            WL_POINTER_AXIS_SOURCE_CONTINUOUS);
-          break;
+
+      if (horiz_scroll_present) {
+        double horiz_scroll_value = libinput_event_pointer_get_scroll_value(
+          pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL);
+        if (horiz_scroll_value == 0) {
+          zwlr_virtual_pointer_v1_axis_stop(
+            state.layer[coord_data.output_idx]->virt_pointer,
+            ts_milliseconds, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
+        } else {
+          zwlr_virtual_pointer_v1_axis(
+            state.layer[coord_data.output_idx]->virt_pointer,
+            ts_milliseconds, WL_POINTER_AXIS_HORIZONTAL_SCROLL,
+            wl_fixed_from_double(horiz_scroll_value));
+        }
+        switch (ev_type) {
+          case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
+            zwlr_virtual_pointer_v1_axis_source(
+              state.layer[coord_data.output_idx]->virt_pointer,
+              WL_POINTER_AXIS_SOURCE_WHEEL);
+            break;
+          case LIBINPUT_EVENT_POINTER_SCROLL_FINGER:
+            zwlr_virtual_pointer_v1_axis_source(
+              state.layer[coord_data.output_idx]->virt_pointer,
+              WL_POINTER_AXIS_SOURCE_FINGER);
+            break;
+          case LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS:
+            zwlr_virtual_pointer_v1_axis_source(
+              state.layer[coord_data.output_idx]->virt_pointer,
+              WL_POINTER_AXIS_SOURCE_CONTINUOUS);
+            break;
+        }
       }
     }
 
@@ -542,7 +877,8 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
   }
 
   if (mouse_event_handled) {
-    zwlr_virtual_pointer_v1_frame(state.layer.virt_pointer);
+    zwlr_virtual_pointer_v1_frame(
+      state.layer[coord_data.output_idx]->virt_pointer);
   }
   libinput_event_destroy(li_event);
 }
@@ -593,7 +929,6 @@ static void applayer_wayland_init() {
     fprintf(stderr, "FATAL ERROR: Could not create XKB context!");
     exit(1);
   }
-  allocate_drawable_layer(&state, &state.layer);
 }
 
 static void applayer_libinput_init() {
@@ -656,8 +991,12 @@ int main(int argc, char **argv) {
       handle_libinput_event(next_ev_type);
     }
 
-    if (frame_pending)
-      draw_frame(&state);
+    for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+      if (!state.layer[i])
+        continue;
+      if (state.layer[i]->frame_pending)
+        draw_frame(state.layer[i]);
+    }
     wl_display_flush(state.display);
 
     poll(ev_fds, li_fd_count + 1, -1);
