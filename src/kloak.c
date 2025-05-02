@@ -3,22 +3,6 @@
  * See the file COPYING for copying conditions.
  */
 
-/*
- * TODO:
- * - Do we need to be freeing the const char *s sent to us by the server? We
- *   do, don't we? Right now we're just leaking them all.
- * - Technically we could have a situation where there is a gap between
- *   outputs, part or all of a window is occupying that gap, the user's cursor
- *   is in a scrollable or clickable part of that window (that they can't
- *   see), and they try to scroll or click in that part of the window. With
- *   the current implementation, these clicks and scrolls will be lost,
- *   because kloak won't be able to determine which virtual pointer to send
- *   the click events too. Is it possible to send click and scroll events to
- *   *any* virtual pointer and have them work regardless of which pointer is
- *   the technically right one to use? If so, we should do that to correct
- *   this issue.
- */
-
 #include <stdlib.h>
 #include <stdint.h>
 #include <errno.h>
@@ -33,6 +17,7 @@
 #include <sys/types.h>
 #include <dirent.h>
 #include <time.h>
+#include <math.h>
 
 #include <wayland-client.h>
 #include "xdg-output-protocol.h"
@@ -60,7 +45,7 @@ double prev_cursor_y = 0;
 struct disp_state state = { 0 };
 struct libinput *li;
 
-int li_fds[16];
+int li_fds[MAX_INPUT_DEVICES];
 int li_fd_count = 0;
 struct pollfd *ev_fds;
 
@@ -105,8 +90,7 @@ static void randname(char *buf, size_t len) {
   }
 }
 
-static int create_shm_file(size_t size)
-{
+static int create_shm_file(size_t size) {
   int retries = 100;
   int fd = -1;
   do {
@@ -147,11 +131,16 @@ static void recalc_global_space(struct disp_state * state) {
   uint32_t br_corner_x = 0;
   uint32_t br_corner_y = 0;
 
-  for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+  struct output_geometry *screen_list[MAX_DRAWABLE_LAYERS];
+  size_t screen_list_len = 0;
+
+  for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
     if (!state->output_geometry[i])
       continue;
     if (!state->output_geometry[i]->init_done)
       continue;
+    screen_list[screen_list_len] = state->output_geometry[i];
+    ++screen_list_len;
     if (state->output_geometry[i]->x < ul_corner_x) {
       ul_corner_x = state->output_geometry[i]->x;
     }
@@ -187,15 +176,62 @@ static void recalc_global_space(struct disp_state * state) {
       "Upper left corner Y: %d\n", ul_corner_y);
   }
 
+  struct output_geometry *conn_screen_list[MAX_DRAWABLE_LAYERS];
+  conn_screen_list[0] = screen_list[0];
+  size_t conn_screen_list_len = 1;
+
+  /*
+   * Check for gaps between the screens. We don't support running if gaps are
+   * present.
+   *
+   * If a screen's left edge touches another screen, current_screen->x - 1 ==
+   * left_screen->x + left_screen->width.
+   * If a screen's right edge touches another screen, current_screen->x +
+   * current_screen->width == right_screen->x
+   * If a screen's top edge touches another screen, current_screen->y - 1 ==
+   * up_screen->y + up_screen->height
+   * If a screen's bottom edge touches another screen, current_screen->y +
+   * current_screen->height == bottom_screen->y
+   */
+  for (size_t i = 0; i < conn_screen_list_len; ++i) {
+    for (size_t j = 0; j < screen_list_len; ++j) {
+      bool screen_in_conn_list = false;
+      for (size_t k = 0; k < conn_screen_list_len; ++k) {
+        if (screen_list[j] == conn_screen_list[k]) {
+          screen_in_conn_list = true;
+          break;
+        }
+      }
+      if (screen_in_conn_list)
+        continue;
+      struct output_geometry *conn_screen = conn_screen_list[i];
+      struct output_geometry *cur_screen = screen_list[j];
+      if ((conn_screen->x - 1 == cur_screen->x + cur_screen->width)
+        || (conn_screen->x + conn_screen->width == cur_screen->x)
+        || (conn_screen->y - 1 == cur_screen->y + cur_screen->height)
+        || (conn_screen->y + conn_screen->height == cur_screen->y) ) {
+        /* Found a touching screen! */
+        conn_screen_list[conn_screen_list_len] = cur_screen;
+        ++conn_screen_list_len;
+      }
+    }
+  }
+
+  if (conn_screen_list_len != screen_list_len) {
+    fprintf(stderr,
+      "FATAL ERROR: Multiple screens are attached and gaps are present between them. kloak cannot operate in this configuration.\n");
+    exit(1);
+  }
+
   state->global_space_width = br_corner_x - ul_corner_x;
   state->global_space_height = br_corner_y - ul_corner_y;
 }
 
-static struct screen_local_coord abs_coord_to_screen_local_coord(uint32_t x,
-  uint32_t y) {
+static struct screen_local_coord abs_coord_to_screen_local_coord(int32_t x,
+  int32_t y) {
   struct screen_local_coord out_data = { 0 };
 
-  for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+  for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
     if (!state.output_geometry[i]) {
       continue;
     }
@@ -230,6 +266,75 @@ static struct screen_local_coord abs_coord_to_screen_local_coord(uint32_t x,
   return out_data;
 }
 
+static struct coord screen_local_coord_to_abs_coord(uint32_t x, uint32_t y,
+  int32_t output_idx) {
+  struct coord output = {
+    .x = -1,
+    .y = -1,
+  };
+
+  if (!state.layer[output_idx]
+    || x >= state.output_geometry[output_idx]->width
+    || y >= state.output_geometry[output_idx]->height) {
+    return output;
+  }
+  output.x = state.output_geometry[output_idx]->x + x;
+  output.y = state.output_geometry[output_idx]->y + y;
+  return output;
+}
+
+struct coord traverse_line(struct coord start, struct coord end,
+  int32_t pos) {
+  if (pos == 0) return start;
+  struct coord output = { 0 };
+
+  double num = ((double) end.y) - ((double) start.y);
+  double denom = ((double) start.x) - ((double) end.x);
+  if (denom == 0) {
+    /* vertical line */
+    output.x = start.x;
+    if (start.y < end.y) {
+      output.y = start.y + pos;
+    } else {
+      output.y = start.y - pos;
+    }
+    return output;
+  }
+
+  double slope = num / denom;
+  double steep;
+  if (slope < 0)
+    steep = -slope;
+  else
+    steep = slope;
+
+  if (steep < 1) {
+    if (start.x < end.x) {
+      output.x = start.x + pos;
+    } else {
+      output.x = start.x - pos;
+    }
+    if (start.y < end.y) {
+      output.y = start.y + (int32_t)((double) pos * steep);
+    } else {
+      output.y = start.y - (int32_t)((double) pos * steep);
+    }
+  } else {
+    if (start.y < end.y) {
+      output.y = start.y + pos;
+    } else {
+      output.y = start.y - pos;
+    }
+    if (start.x < end.x) {
+      output.x = start.x + (int32_t)((double) pos * (1 / steep));
+    } else {
+      output.x = start.x - (int32_t)((double) pos * (1 / steep));
+    }
+  }
+
+  return output;
+}
+
 /********************/
 /* wayland handling */
 /********************/
@@ -252,26 +357,35 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
     state->shm = wl_registry_bind(registry, name, &wl_shm_interface, 2);
   } else if (strcmp(interface, wl_output_interface.name) == 0) {
     bool new_layer_allocated = false;
-    for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+    for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
       if (!state->layer[i]) {
         state->output[i] = wl_registry_bind(registry, name,
           &wl_output_interface, 4);
-        wl_output_add_listener(state->output[i], &output_listener, state);
         state->layer[i] = malloc(sizeof(struct drawable_layer));
+        memset(state->layer[i], 0, sizeof(struct drawable_layer));
         state->layer[i]->frame_released = true;
         state->layer[i]->frame_pending = true;
         allocate_drawable_layer(state, state->layer[i], state->output[i]);
         if (state->xdg_output_manager) {
-          /* We can only create xdg_outputs for wl_outputs if we've received
+          /*
+           * We can only create xdg_outputs for wl_outputs if we've received
            * the zxdg_output_manager_v1 object from the server, thus the 'if'
            * condition here. When we *do* get the zxdg_output_manager_v1
            * object, we go through and make xdg_outputs for any wl_outputs
-           * that were sent too early. */
+           * that were sent too early.
+           *
+           * NOTE: We do not add wl_output listeners until we have the
+           * zxdg_output_manager_v1 object to avoid the situation where we get
+           * wl_output_done signals before an xdg_output is created for a
+           * wl_output.
+           */
           state->xdg_output[i] = zxdg_output_manager_v1_get_xdg_output(
             state->xdg_output_manager, state->output[i]);
           zxdg_output_v1_add_listener(state->xdg_output[i],
             &xdg_output_listener, state);
+          wl_output_add_listener(state->output[i], &output_listener, state);
           state->output_geometry[i] = malloc(sizeof(struct output_geometry));
+          memset(state->output_geometry[i], 0, sizeof(struct output_geometry));
         }
         new_layer_allocated = true;
         break;
@@ -286,7 +400,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
   } else if (strcmp(interface, zxdg_output_manager_v1_interface.name) == 0) {
     state->xdg_output_manager = wl_registry_bind(registry, name,
       &zxdg_output_manager_v1_interface, 3);
-    for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+    for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
       if (state->output[i]) {
         if (!state->xdg_output[i]) {
           /* This is where we make xdg_outputs for any wl_outputs that were
@@ -295,7 +409,9 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
             state->xdg_output_manager, state->output[i]);
           zxdg_output_v1_add_listener(state->xdg_output[i],
             &xdg_output_listener, state);
+          wl_output_add_listener(state->output[i], &output_listener, state);
           state->output_geometry[i] = malloc(sizeof(struct output_geometry));
+          memset(state->output_geometry[i], 0, sizeof(struct output_geometry));
         }
       }
     }
@@ -316,7 +432,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
 static void registry_handle_global_remove(void *data,
   struct wl_registry *registry, uint32_t name) {
   struct disp_state *state = data;
-  for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+  for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
     if (state->layer[i]) {
       if (wl_proxy_get_id((struct wl_proxy *) state->output[i]) == name) {
         struct drawable_layer *layer = state->layer[i];
@@ -384,7 +500,7 @@ static void kb_handle_keymap(void *data, struct wl_keyboard *kb,
   state->old_kb_map_shm = kb_map_shm;
   state->old_kb_map_shm_size = size;
   if (state->xkb_keymap) {
-    free(state->xkb_keymap);
+    xkb_keymap_unref(state->xkb_keymap);
   }
   state->xkb_keymap = xkb_keymap_new_from_string(
     state->xkb_ctx, kb_map_shm, XKB_KEYMAP_FORMAT_TEXT_V1,
@@ -395,7 +511,7 @@ static void kb_handle_keymap(void *data, struct wl_keyboard *kb,
   }
   close(fd);
   if (state->xkb_state) {
-    free(state->xkb_state);
+    xkb_state_unref(state->xkb_state);
   }
   state->xkb_state = xkb_state_new(state->xkb_keymap);
   if (!state->xkb_state) {
@@ -432,7 +548,7 @@ static void kb_handle_repeat_info(void *data, struct wl_keyboard *kb,
 }
 
 static void wl_buffer_release(void *data, struct wl_buffer *buffer) {
-  for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+  for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
     if (state.layer[i]) {
       if (state.layer[i]->buffer == buffer) {
         state.layer[i]->frame_released = true;
@@ -447,7 +563,7 @@ static void wl_buffer_release(void *data, struct wl_buffer *buffer) {
 static void xdg_output_handle_logical_position(void *data,
   struct zxdg_output_v1 *xdg_output, int32_t x, int32_t y) {
   struct disp_state *state = data;
-  for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+  for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
     if (state->xdg_output[i] == xdg_output) {
       state->output_geometry[i]->x = x;
       state->output_geometry[i]->y = y;
@@ -459,7 +575,7 @@ static void xdg_output_handle_logical_position(void *data,
 static void xdg_output_handle_logical_size(void *data,
   struct zxdg_output_v1 *xdg_output, int32_t width, int32_t height) {
   struct disp_state *state = data;
-  for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+  for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
     if (state->xdg_output[i] == xdg_output) {
       state->output_geometry[i]->width = width;
       state->output_geometry[i]->height = height;
@@ -481,8 +597,12 @@ static void wl_output_handle_mode(void *data, struct wl_output *output,
 
 static void wl_output_info_done(void *data, struct wl_output *output) {
   struct disp_state *state = data;
-  for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+  for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
     if (state->output[i] == output) {
+      struct output_geometry *geometry = state->output_geometry[i];
+      if (geometry->x == 0 && geometry->y == 0 && geometry->width == 0
+        && geometry->height == 0)
+        return;
       state->output_geometry[i]->init_done = true;
       recalc_global_space(state);
       break;
@@ -525,7 +645,7 @@ static void layer_surface_configure(void *data,
   uint32_t height) {
   struct disp_state *state = data;
   struct drawable_layer *layer;
-  for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+  for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
     if (state->layer[i]) {
       if (state->layer[i]->layer_surface == layer_surface) {
         layer = state->layer[i];
@@ -572,16 +692,15 @@ static void layer_surface_configure(void *data,
 
 static int li_open_restricted(const char *path, int flags, void *user_data) {
   int fd = open(path, flags);
-  struct libevdev *evdev_dev;
-  int err = libevdev_new_from_fd(fd, &evdev_dev);
-  if (err != 0) {
-    fprintf(stderr, "FATAL ERROR: Could not create evdev for input device '%s'!\n", path);
-    exit(1);
-  }
-  const char *dev_name = libevdev_get_name(evdev_dev);
   int one = 1;
   if (ioctl(fd, EVIOCGRAB, &one) < 0) {
     fprintf(stderr, "FATAL ERROR: Could not grab evdev device '%s'!\n", path);
+    exit(1);
+  }
+  if (li_fd_count == MAX_INPUT_DEVICES) {
+    fprintf(stderr,
+      "FATAL ERROR: Cannot handle more than %d input devices attached at once!",
+      MAX_INPUT_DEVICES);
     exit(1);
   }
   li_fds[li_fd_count] = fd;
@@ -608,15 +727,34 @@ static void draw_frame(struct drawable_layer *layer) {
     0, layer->width,
     layer->height, layer->stride, WL_SHM_FORMAT_ARGB8888);
 
-  /* Draw a red line in the middle of the buffer */
-  for (int y = 0; y < layer->height; ++y) {
-    for (int x = 0; x < layer->width; ++x) {
-      if (x == (int) cursor_x)
-        layer->pixbuf[y * layer->width + x] = 0xffff0000;
-      else if (y == (int) cursor_y)
-        layer->pixbuf[y * layer->width + x] = 0xffff0000;
-      else
-        layer->pixbuf[y * layer->width + x] = 0x00000000;
+  struct screen_local_coord coord = abs_coord_to_screen_local_coord(
+    (int32_t) cursor_x, (int32_t) cursor_y);
+
+  bool cursor_is_on_layer = false;
+  for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+    if (state.layer[i] == layer) {
+      if (i == coord.output_idx) {
+        cursor_is_on_layer = true;
+      }
+    }
+  }
+
+  if (cursor_is_on_layer) {
+    /* Draw red crosshairs at the pointer location */
+    for (int y = 0; y < layer->height; ++y) {
+      for (int x = 0; x < layer->width; ++x) {
+        if (x == coord.x)
+          layer->pixbuf[y * layer->width + x] = 0xffff0000;
+        else if (y == coord.y)
+          layer->pixbuf[y * layer->width + x] = 0xffff0000;
+        else
+          layer->pixbuf[y * layer->width + x] = 0x00000000;
+      }
+    }
+  } else {
+    /* Blank out the layer */
+    for (size_t i = 0; i < layer->height * layer->width; ++i) {
+      layer->pixbuf[i] = 0;
     }
   }
 
@@ -657,29 +795,101 @@ static void allocate_drawable_layer(struct disp_state *state,
     state->virt_pointer_manager, NULL, layer->output);
 }
 
-static void update_virtual_cursor(struct screen_local_coord prev_coord_data,
-  struct screen_local_coord coord_data, unsigned int ts_milliseconds) {
-  if (prev_coord_data.valid) {
-    if (!state.layer[prev_coord_data.output_idx]) {
-      fprintf(stderr,
-        "FATAL ERROR: Previous coordinate data points to an unallocated drawable layer!\n");
-      exit(1);
+static struct screen_local_coord update_virtual_cursor(
+  uint32_t ts_milliseconds) {
+  struct screen_local_coord prev_coord_data = abs_coord_to_screen_local_coord(
+    (int32_t) prev_cursor_x, (int32_t) prev_cursor_y);
+  struct screen_local_coord coord_data = { 0 };
+
+  if (!prev_coord_data.valid || !state.layer[prev_coord_data.output_idx]) {
+    /* We've somehow gotten into a spot where the previous coordinate data
+     * either is invalid or points at an area where there is no screen. Reset
+     * everything in the hopes of recovering sanity. */
+    fprintf(stderr, "WARNING: Resetting mouse state\n");
+    for (int32_t i = 0; i < MAX_DRAWABLE_LAYERS; i++) {
+      if (state.layer[i]) {
+        struct coord sane_location = screen_local_coord_to_abs_coord(0, 0, i);
+        prev_cursor_x = sane_location.x;
+        prev_cursor_y = sane_location.y;
+        cursor_x = sane_location.x;
+        cursor_y = sane_location.y;
+        prev_coord_data = abs_coord_to_screen_local_coord(
+          (int32_t) prev_cursor_x, (int32_t) prev_cursor_y);
+      }
     }
-    state.layer[prev_coord_data.output_idx]->frame_pending = true;
   }
-  if (coord_data.valid) {
-    if (!state.layer[coord_data.output_idx]) {
-      fprintf(stderr,
-        "FATAL ERROR: Current coordinate data points to an unallocated drawable layer!\n");
-      exit(1);
+
+  struct coord start = {
+    .x = (int32_t) prev_cursor_x,
+    .y = (int32_t) prev_cursor_y,
+  };
+  struct coord end = {
+    .x = (int32_t) cursor_x,
+    .y = (int32_t) cursor_y,
+  };
+  bool end_x_hit = false;
+  bool end_y_hit = false;
+  printf("Start: (%d, %d)\n", start.x, start.y);
+  printf("End: (%d, %d)\n", end.x, end.y);
+  for (int32_t i = 0; ; ++i) {
+    struct coord trav = traverse_line(start, end, i);
+    printf("Mid: (%d, %d)\n", trav.x, trav.y);
+    if (trav.x == end.x) end_x_hit = true;
+    if (trav.y == end.y) end_y_hit = true;
+    struct screen_local_coord trav_coord = abs_coord_to_screen_local_coord(
+      trav.x, trav.y);
+    if (!trav_coord.valid) {
+      trav_coord = abs_coord_to_screen_local_coord(trav.x - 1, trav.y);
+      if (trav_coord.valid) {
+        start.x = trav.x - 1;
+        start.y = trav.y;
+        end.x = trav.x - 1;
+        i = -1;
+        continue;
+      }
+      trav_coord = abs_coord_to_screen_local_coord(trav.x + 1, trav.y);
+      if (trav_coord.valid) {
+        start.x = trav.x + 1;
+        start.y = trav.y;
+        end.x = trav.x + 1;
+        i = -1;
+        continue;
+      }
+      trav_coord = abs_coord_to_screen_local_coord(trav.x, trav.y - 1);
+      if (trav_coord.valid) {
+        start.y = trav.y - 1;
+        start.x = trav.x;
+        end.y = trav.y -1;
+        i = -1;
+        continue;
+      }
+      trav_coord = abs_coord_to_screen_local_coord(trav.x, trav.y + 1);
+      if (trav_coord.valid) {
+        start.y = trav.y + 1;
+        start.x = trav.x;
+        end.y = trav.y + 1;
+        i = -1;
+        continue;
+      }
     }
-    state.layer[coord_data.output_idx]->frame_pending = true;
-    zwlr_virtual_pointer_v1_motion_absolute(
-      state.layer[coord_data.output_idx]->virt_pointer,
-      ts_milliseconds, (uint32_t) coord_data.x, (uint32_t) coord_data.y,
-      state.layer[coord_data.output_idx]->width,
-      state.layer[coord_data.output_idx]->height);
+    if (end_x_hit && end_y_hit) {
+      cursor_x = end.x;
+      cursor_y = end.y;
+      break;
+    }
   }
+  coord_data = abs_coord_to_screen_local_coord((int32_t) cursor_x,
+    (int32_t) cursor_y);
+  printf("\n");
+
+  state.layer[prev_coord_data.output_idx]->frame_pending = true;
+  state.layer[coord_data.output_idx]->frame_pending = true;
+  zwlr_virtual_pointer_v1_motion_absolute(
+    state.layer[coord_data.output_idx]->virt_pointer,
+    ts_milliseconds, (uint32_t) coord_data.x, (uint32_t) coord_data.y,
+    state.layer[coord_data.output_idx]->width,
+    state.layer[coord_data.output_idx]->height);
+  return coord_data;
 }
 
 static void handle_libinput_event(enum libinput_event_type ev_type) {
@@ -690,16 +900,13 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
   unsigned int ts_milliseconds = ts.tv_sec * 1000;
   ts_milliseconds += (ts.tv_nsec / 1000000);
 
-  struct screen_local_coord prev_coord_data = { 0 };
   struct screen_local_coord coord_data = { 0 };
   struct libinput_event *li_event = libinput_get_event(li);
 
   if (ev_type != LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE
     && ev_type != LIBINPUT_EVENT_POINTER_MOTION) {
-    /* prev_coord_data is only needed for motion events, which have to
-     * generate it after updating cursor data anyway, so we don't need to
-     * generate it here. */
-    coord_data = abs_coord_to_screen_local_coord(cursor_x, cursor_y);
+    coord_data = abs_coord_to_screen_local_coord((int32_t) cursor_x,
+      (int32_t) cursor_y);
   }
 
   if (ev_type == LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE) {
@@ -714,10 +921,7 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
     prev_cursor_y = cursor_y;
     cursor_x = abs_x;
     cursor_y = abs_y;
-    prev_coord_data = abs_coord_to_screen_local_coord(prev_cursor_x,
-      prev_cursor_y);
-    coord_data = abs_coord_to_screen_local_coord(cursor_x, cursor_y);
-    update_virtual_cursor(prev_coord_data, coord_data, ts_milliseconds);
+    coord_data = update_virtual_cursor(ts_milliseconds);
 
   } else if (ev_type == LIBINPUT_EVENT_POINTER_MOTION) {
     mouse_event_handled = true;
@@ -725,18 +929,17 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
       = libinput_event_get_pointer_event(li_event);
     double rel_x = libinput_event_pointer_get_dx(pointer_event);
     double rel_y = libinput_event_pointer_get_dy(pointer_event);
+    prev_cursor_x = cursor_x;
+    prev_cursor_y = cursor_y;
     cursor_x += rel_x;
     cursor_y += rel_y;
     if (cursor_x < 0) cursor_x = 0;
     if (cursor_y < 0) cursor_y = 0;
-    if (cursor_x > state.global_space_width)
-      cursor_x = state.global_space_width;
-    if (cursor_y > state.global_space_height)
-      cursor_y = state.global_space_height;
-    prev_coord_data = abs_coord_to_screen_local_coord(prev_cursor_x,
-      prev_cursor_y);
-    coord_data = abs_coord_to_screen_local_coord(cursor_x, cursor_y);
-    update_virtual_cursor(prev_coord_data, coord_data, ts_milliseconds);
+    if (cursor_x > state.global_space_width - 1)
+      cursor_x = state.global_space_width - 1;
+    if (cursor_y > state.global_space_height - 1)
+      cursor_y = state.global_space_height - 1;
+    coord_data = update_virtual_cursor(ts_milliseconds);
 
   } else if (ev_type == LIBINPUT_EVENT_POINTER_BUTTON) {
     mouse_event_handled = true;
@@ -956,13 +1159,14 @@ static void applayer_libinput_init() {
     libinput_path_add_device(li, dev_path);
     free(dev_path);
   }
+  closedir(dev_input_dir);
 }
 
 static void applayer_poll_init() {
   ev_fds = calloc(1 + li_fd_count, sizeof(struct pollfd));
   ev_fds[0].fd = state.display_fd;
   ev_fds[0].events = POLLIN;
-  for (int i = 0; i < li_fd_count; ++i) {
+  for (size_t i = 0; i < li_fd_count; ++i) {
     ev_fds[i+1].fd = li_fds[i];
     ev_fds[i+1].events = POLLIN;
   }
@@ -991,7 +1195,7 @@ int main(int argc, char **argv) {
       handle_libinput_event(next_ev_type);
     }
 
-    for (int i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+    for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
       if (!state.layer[i])
         continue;
       if (state.layer[i]->frame_pending)
@@ -1009,7 +1213,7 @@ int main(int argc, char **argv) {
     }
     ev_fds[0].revents = 0;
 
-    for (int i = 0; i < li_fd_count; ++i) {
+    for (size_t i = 0; i < li_fd_count; ++i) {
       if (ev_fds[i+1].revents & POLLIN) {
         libinput_dispatch(li);
         break;

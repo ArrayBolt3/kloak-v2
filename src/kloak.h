@@ -8,6 +8,7 @@
 #include <libinput.h>
 
 #define MAX_DRAWABLE_LAYERS 128
+#define MAX_INPUT_DEVICES 32
 
 /*******************/
 /* core structures */
@@ -44,8 +45,13 @@ struct output_geometry {
 struct screen_local_coord {
   uint32_t x;
   uint32_t y;
-  int output_idx;
+  int32_t output_idx;
   bool valid;
+};
+
+struct coord {
+  int32_t x;
+  int32_t y;
 };
 
 struct disp_state {
@@ -89,8 +95,12 @@ static void panic(const char *, int);
 static void randname(char *, size_t);
 static int create_shm_file(size_t);
 static void recalc_global_space(struct disp_state *);
-static struct screen_local_coord abs_coord_to_screen_local_coord(uint32_t x,
-  uint32_t y);
+static struct screen_local_coord abs_coord_to_screen_local_coord(int32_t,
+  int32_t);
+static struct coord screen_local_coord_to_abs_coord(uint32_t, uint32_t,
+  int32_t);
+static struct coord traverse_line(struct coord start, struct coord end,
+  int32_t pos);
 
 /********************/
 /* wayland handling */
@@ -153,7 +163,8 @@ static void draw_frame(struct drawable_layer *);
   struct drawable_layer *, int, int);*/
 static void allocate_drawable_layer(struct disp_state *,
   struct drawable_layer *, struct wl_output *);
-static void update_virtual_cursor();
+static struct screen_local_coord update_virtual_cursor(
+  uint32_t ts_milliseconds);
 static void handle_libinput_event(enum libinput_event_type);
 
 /****************************/
