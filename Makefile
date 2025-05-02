@@ -47,5 +47,36 @@ all : kloak
 kloak : src/kloak.c src/kloak.h src/xdg-shell-protocol.h src/xdg-shell-protocol.c src/xdg-output-protocol.h src/xdg-output-protocol.c src/wlr-layer-shell.c src/wlr-layer-shell.h src/wlr-virtual-pointer.c src/wlr-virtual-pointer.h src/virtual-keyboard.c src/virtual-keyboard.h
 	$(CC) -g src/kloak.c src/xdg-shell-protocol.c src/xdg-output-protocol.c src/wlr-layer-shell.c src/wlr-virtual-pointer.c src/virtual-keyboard.c -o kloak -lm -lrt $(shell $(PKG_CONFIG) --cflags --libs libinput) $(shell $(PKG_CONFIG) --cflags --libs libevdev) $(shell $(PKG_CONFIG) --cflags --libs wayland-client) $(shell $(PKG_CONFIG) --cflags --libs xkbcommon)
 
+src/xdg-shell-protocol.h : protocol/xdg-shell.xml
+	wayland-scanner client-header < protocol/xdg-shell.xml > src/xdg-shell-protocol.h
+
+src/xdg-shell-protocol.c : protocol/xdg-shell.xml
+	wayland-scanner private-code < protocol/xdg-shell.xml > src/xdg-shell-protocol.c
+
+src/xdg-output-protocol.h : protocol/xdg-output-unstable-v1.xml
+	wayland-scanner client-header < protocol/xdg-output-unstable-v1.xml > src/xdg-output-protocol.h
+
+src/xdg-output-protocol.c : protocol/xdg-output-unstable-v1.xml
+	wayland-scanner private-code < protocol/xdg-output-unstable-v1.xml > src/xdg-output-protocol.c
+
+src/wlr-layer-shell.h : protocol/wlr-layer-shell-unstable-v1.xml
+	wayland-scanner client-header < protocol/wlr-layer-shell-unstable-v1.xml > src/wlr-layer-shell.h
+
+src/wlr-layer-shell.c : protocol/wlr-layer-shell-unstable-v1.xml
+	wayland-scanner private-code < protocol/wlr-layer-shell-unstable-v1.xml > src/wlr-layer-shell.c
+
+src/wlr-virtual-pointer.h : protocol/wlr-virtual-pointer-unstable-v1.xml
+	wayland-scanner client-header < protocol/wlr-virtual-pointer-unstable-v1.xml > src/wlr-virtual-pointer.h
+
+src/wlr-virtual-pointer.c : protocol/wlr-virtual-pointer-unstable-v1.xml
+	wayland-scanner private-code < protocol/wlr-virtual-pointer-unstable-v1.xml > src/wlr-virtual-pointer.c
+
+src/virtual-keyboard.h : protocol/virtual-keyboard-unstable-v1.xml
+	wayland-scanner client-header < protocol/virtual-keyboard-unstable-v1.xml > src/virtual-keyboard.h
+
+src/virtual-keyboard.c : protocol/virtual-keyboard-unstable-v1.xml
+	wayland-scanner private-code < protocol/virtual-keyboard-unstable-v1.xml > src/virtual-keyboard.c
+
 clean :
 	rm -f kloak
+	rm -f src/xdg-shell-protocol.h src/xdg-shell-protocol.c src/xdg-output-protocol.h src/xdg-output-protocol.c src/wlr-layer-shell.h src/wlr-layer-shell.c src/wlr-virtual-pointer.h src/wlr-virtual-pointer.c src/virtual-keyboard.h src/virtual-keyboard.c
