@@ -167,14 +167,6 @@ static void recalc_global_space(struct disp_state * state) {
     /* same as above */
     return;
   }
-  if (ul_corner_x != 0 || ul_corner_y != 0) {
-    fprintf(stderr,
-      "WARNING: Upper left corner of global compositor space is not at (0,0), application will probably misbehave\n");
-    fprintf(stderr,
-      "Upper left corner X: %d\n", ul_corner_x);
-    fprintf(stderr,
-      "Upper left corner Y: %d\n", ul_corner_y);
-  }
 
   struct output_geometry *conn_screen_list[MAX_DRAWABLE_LAYERS];
   conn_screen_list[0] = screen_list[0];
@@ -184,11 +176,11 @@ static void recalc_global_space(struct disp_state * state) {
    * Check for gaps between the screens. We don't support running if gaps are
    * present.
    *
-   * If a screen's left edge touches another screen, current_screen->x - 1 ==
+   * If a screen's left edge touches another screen, current_screen->x ==
    * left_screen->x + left_screen->width.
    * If a screen's right edge touches another screen, current_screen->x +
    * current_screen->width == right_screen->x
-   * If a screen's top edge touches another screen, current_screen->y - 1 ==
+   * If a screen's top edge touches another screen, current_screen->y ==
    * up_screen->y + up_screen->height
    * If a screen's bottom edge touches another screen, current_screen->y +
    * current_screen->height == bottom_screen->y
@@ -206,9 +198,9 @@ static void recalc_global_space(struct disp_state * state) {
         continue;
       struct output_geometry *conn_screen = conn_screen_list[i];
       struct output_geometry *cur_screen = screen_list[j];
-      if ((conn_screen->x - 1 == cur_screen->x + cur_screen->width)
+      if ((conn_screen->x == cur_screen->x + cur_screen->width)
         || (conn_screen->x + conn_screen->width == cur_screen->x)
-        || (conn_screen->y - 1 == cur_screen->y + cur_screen->height)
+        || (conn_screen->y == cur_screen->y + cur_screen->height)
         || (conn_screen->y + conn_screen->height == cur_screen->y) ) {
         /* Found a touching screen! */
         conn_screen_list[conn_screen_list_len] = cur_screen;
@@ -223,8 +215,8 @@ static void recalc_global_space(struct disp_state * state) {
     exit(1);
   }
 
-  state->global_space_width = br_corner_x - ul_corner_x;
-  state->global_space_height = br_corner_y - ul_corner_y;
+  state->global_space_width = br_corner_x;
+  state->global_space_height = br_corner_y;
 }
 
 static struct screen_local_coord abs_coord_to_screen_local_coord(int32_t x,
@@ -335,6 +327,30 @@ struct coord traverse_line(struct coord start, struct coord end,
   return output;
 }
 
+static void draw_block(uint32_t *pixbuf, int32_t x, int32_t y,
+  int32_t layer_width, int32_t layer_height, int32_t rad, bool crosshair) {
+  int32_t start_x = x - rad;
+  if (start_x < 0) start_x = 0;
+  int32_t start_y = y - rad;
+  if (start_y < 0) start_y = 0;
+  int32_t end_x = x + rad;
+  if (end_x >= layer_width) end_x = layer_width - 1;
+  int32_t end_y = y + rad;
+  if (end_y >= layer_height) end_y = layer_height - 1;
+
+  for (int32_t work_y = start_y; work_y < end_y; ++work_y) {
+    for (int32_t work_x = start_x; work_x < end_x; ++work_x) {
+      if (crosshair && work_x == x) {
+        pixbuf[work_y * layer_width + work_x] = 0xffff0000;
+      } else if (crosshair && work_y == y) {
+        pixbuf[work_y * layer_width + work_x] = 0xffff0000;
+      } else {
+        pixbuf[work_y * layer_width + work_x] = 0x00000000;
+      }
+    }
+  }
+}
+
 /********************/
 /* wayland handling */
 /********************/
@@ -365,6 +381,8 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
         memset(state->layer[i], 0, sizeof(struct drawable_layer));
         state->layer[i]->frame_released = true;
         state->layer[i]->frame_pending = true;
+        state->layer[i]->last_drawn_cursor_x = -1;
+        state->layer[i]->last_drawn_cursor_y = -1;
         allocate_drawable_layer(state, state->layer[i], state->output[i]);
         if (state->xdg_output_manager) {
           /*
@@ -729,6 +747,8 @@ static void draw_frame(struct drawable_layer *layer) {
 
   struct screen_local_coord coord = abs_coord_to_screen_local_coord(
     (int32_t) cursor_x, (int32_t) cursor_y);
+  struct screen_local_coord prev_coord = abs_coord_to_screen_local_coord(
+    (int32_t) prev_cursor_x, (int32_t) prev_cursor_y);
 
   bool cursor_is_on_layer = false;
   for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
@@ -739,30 +759,41 @@ static void draw_frame(struct drawable_layer *layer) {
     }
   }
 
+  if (layer->last_drawn_cursor_x >= 0 && layer->last_drawn_cursor_y >= 0) {
+    /* Blank out the previous cursor location */
+    draw_block(layer->pixbuf, layer->last_drawn_cursor_x,
+      layer->last_drawn_cursor_y, layer->width, layer->height,
+      CURSOR_RADIUS, false);
+    damage_surface_enh(layer->surface,
+      layer->last_drawn_cursor_x - CURSOR_RADIUS,
+      layer->last_drawn_cursor_y - CURSOR_RADIUS,
+      layer->last_drawn_cursor_x + CURSOR_RADIUS,
+      layer->last_drawn_cursor_y + CURSOR_RADIUS);
+  }
   if (cursor_is_on_layer) {
     /* Draw red crosshairs at the pointer location */
-    for (int y = 0; y < layer->height; ++y) {
-      for (int x = 0; x < layer->width; ++x) {
-        if (x == coord.x)
-          layer->pixbuf[y * layer->width + x] = 0xffff0000;
-        else if (y == coord.y)
-          layer->pixbuf[y * layer->width + x] = 0xffff0000;
-        else
-          layer->pixbuf[y * layer->width + x] = 0x00000000;
-      }
-    }
-  } else {
-    /* Blank out the layer */
-    for (size_t i = 0; i < layer->height * layer->width; ++i) {
-      layer->pixbuf[i] = 0;
-    }
+    draw_block(layer->pixbuf, coord.x, coord.y, layer->width, layer->height,
+      CURSOR_RADIUS, true);
+    damage_surface_enh(layer->surface, coord.x - CURSOR_RADIUS,
+      coord.y - CURSOR_RADIUS, coord.x + CURSOR_RADIUS,
+      coord.y + CURSOR_RADIUS);
   }
 
   wl_buffer_add_listener(buffer, &buffer_listener, NULL);
   layer->buffer = buffer;
   wl_surface_attach(layer->surface, buffer, 0, 0);
-  wl_surface_damage_buffer(layer->surface, 0, 0, INT32_MAX, INT32_MAX);
+  /*wl_surface_damage_buffer(layer->surface, coord.x - 15, coord.y - 15,
+    coord.x + 15, coord.y + 15);
+  wl_surface_damage_buffer(layer->surface, prev_coord.x - 15,
+    prev_coord.y - 15, prev_coord.x + 15, prev_coord.y + 15);*/
   wl_surface_commit(layer->surface);
+  if (cursor_is_on_layer) {
+    layer->last_drawn_cursor_x = coord.x;
+    layer->last_drawn_cursor_y = coord.y;
+  } else {
+    layer->last_drawn_cursor_x = -1;
+    layer->last_drawn_cursor_y = -1;
+  }
   layer->frame_released = false;
 }
 
@@ -795,6 +826,13 @@ static void allocate_drawable_layer(struct disp_state *state,
     state->virt_pointer_manager, NULL, layer->output);
 }
 
+static void damage_surface_enh(struct wl_surface *surface, int32_t x,
+  int32_t y, int32_t width, int32_t height) {
+  if (x < 0) x = 0;
+  if (y < 0) y = 0;
+  wl_surface_damage_buffer(surface, x, y, width, height);
+}
+
 static struct screen_local_coord update_virtual_cursor(
   uint32_t ts_milliseconds) {
   struct screen_local_coord prev_coord_data = abs_coord_to_screen_local_coord(
@@ -819,6 +857,35 @@ static struct screen_local_coord update_virtual_cursor(
     }
   }
 
+  /*
+   * Ensure the cursor doesn't move off-screen, and recalculate its end
+   * position if it would end up off-screen.
+   *
+   * This is a bit tricky to do since we can't just look at the intended final
+   * location of the mouse and move it there if that location is valid, since
+   * that would allow jumping over "voids" in the compositor global space
+   * (places whether global space has a pixel but no screen covers that
+   * pixel). Instead, we use the following algorithm:
+   *
+   * - Take the previous cursor position and treat it as a "start location".
+   *   Treat the current cursor position as an "end location".
+   * - Start walking in a straight line from the start location to the end
+   *   location, one pixel at a time.
+   * - Once we hit the end location, move the real mouse cursor there.
+   * - Each time we walk forward a pixel, calculate the screen-local
+   *   coordinates of that pixel, and ensure it actually is on a screen.
+   * - If a pixel is NOT on any screen, determine which direction we can move
+   *   to get back onto a screen. Move one pixel in that direction, then
+   *   change the start location to this new position and adjust the end
+   *   location so that we can walk to it moving in a straight line without
+   *   moving any further in the dimension we just moved to get back to a
+   *   screen. I.e., if we moved horizontally to the left one pixel to get
+   *   back on a screen, move the end location so that we can walk to it in a
+   *   vertical line. This allows us to "glide" along the wall.
+   *
+   * This sounds like an awful lot of work, but I couldn't find another way to
+   * get the mouse to glide smoothly along edges while still respecting them.
+   */
   struct coord start = {
     .x = (int32_t) prev_cursor_x,
     .y = (int32_t) prev_cursor_y,
@@ -827,49 +894,57 @@ static struct screen_local_coord update_virtual_cursor(
     .x = (int32_t) cursor_x,
     .y = (int32_t) cursor_y,
   };
+  struct coord prev_trav = start;
   bool end_x_hit = false;
   bool end_y_hit = false;
-  printf("Start: (%d, %d)\n", start.x, start.y);
-  printf("End: (%d, %d)\n", end.x, end.y);
   for (int32_t i = 0; ; ++i) {
     struct coord trav = traverse_line(start, end, i);
-    printf("Mid: (%d, %d)\n", trav.x, trav.y);
     if (trav.x == end.x) end_x_hit = true;
     if (trav.y == end.y) end_y_hit = true;
     struct screen_local_coord trav_coord = abs_coord_to_screen_local_coord(
       trav.x, trav.y);
     if (!trav_coord.valid) {
-      trav_coord = abs_coord_to_screen_local_coord(trav.x - 1, trav.y);
-      if (trav_coord.valid) {
-        start.x = trav.x - 1;
-        start.y = trav.y;
-        end.x = trav.x - 1;
-        i = -1;
-        continue;
+      /* Figure out what direction we moved when we went off screen, and move
+       * move backwards in that direction, but in only one dimension. */
+      if (prev_trav.x < trav.x) {
+        trav_coord = abs_coord_to_screen_local_coord(trav.x - 1, trav.y);
+        if (trav_coord.valid) {
+          start.x = trav.x - 1;
+          start.y = trav.y;
+          end.x = trav.x - 1;
+          i = -1;
+          continue;
+        }
       }
-      trav_coord = abs_coord_to_screen_local_coord(trav.x + 1, trav.y);
-      if (trav_coord.valid) {
-        start.x = trav.x + 1;
-        start.y = trav.y;
-        end.x = trav.x + 1;
-        i = -1;
-        continue;
+      if (prev_trav.x > trav.x) {
+        trav_coord = abs_coord_to_screen_local_coord(trav.x + 1, trav.y);
+        if (trav_coord.valid) {
+          start.x = trav.x + 1;
+          start.y = trav.y;
+          end.x = trav.x + 1;
+          i = -1;
+          continue;
+        }
       }
-      trav_coord = abs_coord_to_screen_local_coord(trav.x, trav.y - 1);
-      if (trav_coord.valid) {
-        start.y = trav.y - 1;
-        start.x = trav.x;
-        end.y = trav.y -1;
-        i = -1;
-        continue;
+      if (prev_trav.y < trav.y) {
+        trav_coord = abs_coord_to_screen_local_coord(trav.x, trav.y - 1);
+        if (trav_coord.valid) {
+          start.y = trav.y - 1;
+          start.x = trav.x;
+          end.y = trav.y -1;
+          i = -1;
+          continue;
+        }
       }
-      trav_coord = abs_coord_to_screen_local_coord(trav.x, trav.y + 1);
-      if (trav_coord.valid) {
-        start.y = trav.y + 1;
-        start.x = trav.x;
-        end.y = trav.y + 1;
-        i = -1;
-        continue;
+      if (prev_trav.y > trav.y) {
+        trav_coord = abs_coord_to_screen_local_coord(trav.x, trav.y + 1);
+        if (trav_coord.valid) {
+          start.y = trav.y + 1;
+          start.x = trav.x;
+          end.y = trav.y + 1;
+          i = -1;
+          continue;
+        }
       }
     }
     if (end_x_hit && end_y_hit) {
@@ -877,10 +952,10 @@ static struct screen_local_coord update_virtual_cursor(
       cursor_y = end.y;
       break;
     }
+    prev_trav = trav;
   }
   coord_data = abs_coord_to_screen_local_coord((int32_t) cursor_x,
     (int32_t) cursor_y);
-  printf("\n");
 
   state.layer[prev_coord_data.output_idx]->frame_pending = true;
   state.layer[coord_data.output_idx]->frame_pending = true;

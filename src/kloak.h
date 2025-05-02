@@ -9,6 +9,7 @@
 
 #define MAX_DRAWABLE_LAYERS 128
 #define MAX_INPUT_DEVICES 32
+#define CURSOR_RADIUS 15
 
 /*******************/
 /* core structures */
@@ -32,6 +33,8 @@ struct drawable_layer {
   /* Sync state */
   bool frame_released;
   bool frame_pending;
+  int32_t last_drawn_cursor_x;
+  int32_t last_drawn_cursor_y;
 };
 
 struct output_geometry {
@@ -43,8 +46,8 @@ struct output_geometry {
 };
 
 struct screen_local_coord {
-  uint32_t x;
-  uint32_t y;
+  int32_t x;
+  int32_t y;
   int32_t output_idx;
   bool valid;
 };
@@ -101,6 +104,8 @@ static struct coord screen_local_coord_to_abs_coord(uint32_t, uint32_t,
   int32_t);
 static struct coord traverse_line(struct coord start, struct coord end,
   int32_t pos);
+static void draw_block(uint32_t *, int32_t, int32_t, int32_t, int32_t,
+  int32_t, bool);
 
 /********************/
 /* wayland handling */
@@ -159,10 +164,10 @@ static void li_close_restricted(int, void *);
 /************************/
 
 static void draw_frame(struct drawable_layer *);
-/*static void allocate_drawable_layer(struct disp_state *,
-  struct drawable_layer *, int, int);*/
 static void allocate_drawable_layer(struct disp_state *,
   struct drawable_layer *, struct wl_output *);
+static void damage_surface_enh(struct wl_surface *, int32_t, int32_t, int32_t,
+  int32_t);
 static struct screen_local_coord update_virtual_cursor(
   uint32_t ts_milliseconds);
 static void handle_libinput_event(enum libinput_event_type);
