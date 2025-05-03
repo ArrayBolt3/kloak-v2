@@ -843,7 +843,6 @@ static struct screen_local_coord update_virtual_cursor(
     /* We've somehow gotten into a spot where the previous coordinate data
      * either is invalid or points at an area where there is no screen. Reset
      * everything in the hopes of recovering sanity. */
-    fprintf(stderr, "WARNING: Resetting mouse state\n");
     for (int32_t i = 0; i < MAX_DRAWABLE_LAYERS; i++) {
       if (state.layer[i]) {
         struct coord sane_location = screen_local_coord_to_abs_coord(0, 0, i);
@@ -948,8 +947,12 @@ static struct screen_local_coord update_virtual_cursor(
       }
     }
     if (end_x_hit && end_y_hit) {
-      cursor_x = end.x;
-      cursor_y = end.y;
+      if ((int32_t) cursor_x != end.x) {
+        cursor_x = end.x;
+      }
+      if ((int32_t) cursor_y != end.y) {
+        cursor_y = end.y;
+      }
       break;
     }
     prev_trav = trav;
