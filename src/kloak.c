@@ -1234,7 +1234,14 @@ static void applayer_libinput_init() {
       * sizeof(char));
     char *dev_path_post = stpcpy(dev_path, "/dev/input/");
     strcpy(dev_path_post, dev_input_entry->d_name);
-    libinput_path_add_device(li, dev_path);
+    struct libinput_device *li_dev = libinput_path_add_device(li, dev_path);
+    if (li_dev) {
+      int32_t can_tap = libinput_device_config_tap_get_finger_count(li_dev);
+      if (can_tap) {
+        libinput_device_config_tap_set_enabled(li_dev,
+          LIBINPUT_CONFIG_TAB_ENABLED);
+      }
+    }
     free(dev_path);
   }
   closedir(dev_input_dir);
