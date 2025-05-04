@@ -8,7 +8,6 @@
 #include <libinput.h>
 
 #define MAX_DRAWABLE_LAYERS 128
-#define MAX_INPUT_DEVICES 32
 #define CURSOR_RADIUS 15
 
 /*******************/

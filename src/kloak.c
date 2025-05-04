@@ -45,8 +45,6 @@ double prev_cursor_y = 0;
 struct disp_state state = { 0 };
 struct libinput *li;
 
-int li_fds[MAX_INPUT_DEVICES];
-int li_fd_count = 0;
 struct pollfd *ev_fds;
 
 /*********************/
@@ -715,14 +713,6 @@ static int li_open_restricted(const char *path, int flags, void *user_data) {
     fprintf(stderr, "FATAL ERROR: Could not grab evdev device '%s'!\n", path);
     exit(1);
   }
-  if (li_fd_count == MAX_INPUT_DEVICES) {
-    fprintf(stderr,
-      "FATAL ERROR: Cannot handle more than %d input devices attached at once!",
-      MAX_INPUT_DEVICES);
-    exit(1);
-  }
-  li_fds[li_fd_count] = fd;
-  ++li_fd_count;
   return fd < 0 ? -errno : fd;
 }
 
@@ -1239,7 +1229,7 @@ static void applayer_libinput_init() {
       int32_t can_tap = libinput_device_config_tap_get_finger_count(li_dev);
       if (can_tap) {
         libinput_device_config_tap_set_enabled(li_dev,
-          LIBINPUT_CONFIG_TAB_ENABLED);
+          LIBINPUT_CONFIG_TAP_ENABLED);
       }
     }
     free(dev_path);
@@ -1248,13 +1238,11 @@ static void applayer_libinput_init() {
 }
 
 static void applayer_poll_init() {
-  ev_fds = calloc(1 + li_fd_count, sizeof(struct pollfd));
+  ev_fds = calloc(2, sizeof(struct pollfd));
   ev_fds[0].fd = state.display_fd;
   ev_fds[0].events = POLLIN;
-  for (size_t i = 0; i < li_fd_count; ++i) {
-    ev_fds[i+1].fd = li_fds[i];
-    ev_fds[i+1].events = POLLIN;
-  }
+  ev_fds[1].fd = libinput_get_fd(li);
+  ev_fds[1].events = POLLIN;
 }
 
 /**********/
@@ -1288,7 +1276,7 @@ int main(int argc, char **argv) {
     }
     wl_display_flush(state.display);
 
-    poll(ev_fds, li_fd_count + 1, -1);
+    poll(ev_fds, 2, -1);
 
     if (ev_fds[0].revents & POLLIN) {
       wl_display_read_events(state.display);
@@ -1298,13 +1286,10 @@ int main(int argc, char **argv) {
     }
     ev_fds[0].revents = 0;
 
-    for (size_t i = 0; i < li_fd_count; ++i) {
-      if (ev_fds[i+1].revents & POLLIN) {
-        libinput_dispatch(li);
-        break;
-      }
-      ev_fds[i+1].revents = 0;
+    if (ev_fds[1].revents & POLLIN) {
+      libinput_dispatch(li);
     }
+    ev_fds[1].revents = 0;
   }
 
   wl_display_disconnect(state.display);
