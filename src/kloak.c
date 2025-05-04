@@ -25,10 +25,9 @@
 #include "wlr-virtual-pointer.h"
 #include "virtual-keyboard.h"
 
+#include <libudev.h>
 #include <libinput.h>
-
 #include <libevdev/libevdev.h>
-
 #include <xkbcommon/xkbcommon.h>
 
 #include "kloak.h"
@@ -44,6 +43,7 @@ double prev_cursor_y = 0;
 
 struct disp_state state = { 0 };
 struct libinput *li;
+struct udev *udev_ctx;
 
 struct pollfd *ev_fds;
 
@@ -972,7 +972,8 @@ static void update_virtual_cursor(uint32_t ts_milliseconds) {
     (uint32_t) cursor_y, state.global_space_width, state.global_space_height);
 }
 
-static void handle_libinput_event(enum libinput_event_type ev_type) {
+static void handle_libinput_event(enum libinput_event_type ev_type,
+  struct libinput_event *li_event) {
   bool mouse_event_handled = false;
 
   struct timespec ts;
@@ -980,9 +981,13 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
   unsigned int ts_milliseconds = ts.tv_sec * 1000;
   ts_milliseconds += (ts.tv_nsec / 1000000);
 
-  struct libinput_event *li_event = libinput_get_event(li);
-
-  if (ev_type == LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE) {
+  if (ev_type == LIBINPUT_EVENT_DEVICE_ADDED) {
+    struct libinput_device *new_dev = libinput_event_get_device(li_event);
+    int can_tap = libinput_device_config_tap_get_finger_count(new_dev);
+    if (can_tap) {
+      libinput_device_config_tap_set_enabled(new_dev, LIBINPUT_CONFIG_TAP_ENABLED);
+    }
+  } else if (ev_type == LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE) {
     mouse_event_handled = true;
     struct libinput_event_pointer *pointer_event
       = libinput_event_get_pointer_event(li_event);
@@ -1135,6 +1140,10 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
   libinput_event_destroy(li_event);
 }
 
+static void schedule_libinput_event(enum libinput_event_type ev_type,
+  struct libinput_event *li_event) {
+}
+
 /****************************/
 /* initialization functions */
 /****************************/
@@ -1184,38 +1193,10 @@ static void applayer_wayland_init() {
 }
 
 static void applayer_libinput_init() {
-  li = libinput_path_create_context(&li_interface, NULL);
-  DIR *dev_input_dir = opendir("/dev/input");
-  if (dev_input_dir == NULL) {
-    fprintf(stderr, "FATAL ERROR: Could not open directory /dev/input: %s\n",
-      strerror(errno));
-    exit(1);
-  }
-  struct dirent *dev_input_entry;
-
-  while ((dev_input_entry = readdir(dev_input_dir)) != NULL) {
-    if (dev_input_entry->d_type != DT_CHR)
-      continue;
-    /* eventX = 6 characters */
-    if (strlen(dev_input_entry->d_name) < 6)
-      continue;
-    if (strncmp(dev_input_entry->d_name, "event", 5) != 0)
-      continue;
-    char *dev_path = malloc(11 + strlen(dev_input_entry->d_name) + 1
-      * sizeof(char));
-    char *dev_path_post = stpcpy(dev_path, "/dev/input/");
-    strcpy(dev_path_post, dev_input_entry->d_name);
-    struct libinput_device *li_dev = libinput_path_add_device(li, dev_path);
-    if (li_dev) {
-      int32_t can_tap = libinput_device_config_tap_get_finger_count(li_dev);
-      if (can_tap) {
-        libinput_device_config_tap_set_enabled(li_dev,
-          LIBINPUT_CONFIG_TAP_ENABLED);
-      }
-    }
-    free(dev_path);
-  }
-  closedir(dev_input_dir);
+  udev_ctx = udev_new();
+  li = libinput_udev_create_context(&li_interface, NULL, udev_ctx);
+  /* TODO: Allow customizing the seat with a command line arg */
+  libinput_udev_assign_seat(li, "seat0");
 }
 
 static void applayer_poll_init() {
@@ -1246,7 +1227,8 @@ int main(int argc, char **argv) {
       enum libinput_event_type next_ev_type = libinput_next_event_type(li);
       if (next_ev_type == LIBINPUT_EVENT_NONE)
         break;
-      handle_libinput_event(next_ev_type);
+      struct libinput_event *li_event = libinput_get_event(li);
+      handle_libinput_event(next_ev_type, li_event);
     }
 
     for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
@@ -1257,7 +1239,7 @@ int main(int argc, char **argv) {
     }
     wl_display_flush(state.display);
 
-    poll(ev_fds, 2, -1);
+    poll(ev_fds, 2, POLL_TIMEOUT_MS);
 
     if (ev_fds[0].revents & POLLIN) {
       wl_display_read_events(state.display);

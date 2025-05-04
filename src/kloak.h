@@ -9,6 +9,8 @@
 
 #define MAX_DRAWABLE_LAYERS 128
 #define CURSOR_RADIUS 15
+#define POLL_TIMEOUT_MS 1
+#define DEFAULT_MAX_DELAY_MS 100
 
 /*******************/
 /* core structures */
@@ -168,7 +170,10 @@ static void allocate_drawable_layer(struct disp_state *,
 static void damage_surface_enh(struct wl_surface *, int32_t, int32_t, int32_t,
   int32_t);
 static void update_virtual_cursor(uint32_t);
-static void handle_libinput_event(enum libinput_event_type);
+static void handle_libinput_event(enum libinput_event_type,
+  struct libinput_event *);
+static void schedule_libinput_event(enum libinput_event_type,
+  struct libinput_event *);
 
 /****************************/
 /* initialization functions */
