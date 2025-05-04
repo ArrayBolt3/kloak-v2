@@ -336,8 +336,8 @@ static void draw_block(uint32_t *pixbuf, int32_t x, int32_t y,
   int32_t end_y = y + rad;
   if (end_y >= layer_height) end_y = layer_height - 1;
 
-  for (int32_t work_y = start_y; work_y < end_y; ++work_y) {
-    for (int32_t work_x = start_x; work_x < end_x; ++work_x) {
+  for (int32_t work_y = start_y; work_y <= end_y; ++work_y) {
+    for (int32_t work_x = start_x; work_x <= end_x; ++work_x) {
       if (crosshair && work_x == x) {
         pixbuf[work_y * layer_width + work_x] = 0xffff0000;
       } else if (crosshair && work_y == y) {
@@ -757,16 +757,16 @@ static void draw_frame(struct drawable_layer *layer) {
     damage_surface_enh(layer->surface,
       layer->last_drawn_cursor_x - CURSOR_RADIUS,
       layer->last_drawn_cursor_y - CURSOR_RADIUS,
-      layer->last_drawn_cursor_x + CURSOR_RADIUS,
-      layer->last_drawn_cursor_y + CURSOR_RADIUS);
+      layer->last_drawn_cursor_x + CURSOR_RADIUS + 1,
+      layer->last_drawn_cursor_y + CURSOR_RADIUS + 1);
   }
   if (cursor_is_on_layer) {
     /* Draw red crosshairs at the pointer location */
     draw_block(layer->pixbuf, coord.x, coord.y, layer->width, layer->height,
       CURSOR_RADIUS, true);
     damage_surface_enh(layer->surface, coord.x - CURSOR_RADIUS,
-      coord.y - CURSOR_RADIUS, coord.x + CURSOR_RADIUS,
-      coord.y + CURSOR_RADIUS);
+      coord.y - CURSOR_RADIUS, coord.x + CURSOR_RADIUS + 1,
+      coord.y + CURSOR_RADIUS + 1);
   }
 
   wl_buffer_add_listener(buffer, &buffer_listener, NULL);
