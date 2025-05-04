@@ -452,6 +452,9 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
     strcmp(interface, zwlr_virtual_pointer_manager_v1_interface.name) == 0) {
     state->virt_pointer_manager = wl_registry_bind(registry, name,
       &zwlr_virtual_pointer_manager_v1_interface, 2);
+    state->virt_pointer
+      = zwlr_virtual_pointer_manager_v1_create_virtual_pointer(
+      state->virt_pointer_manager, NULL);
   } else if (
     strcmp(interface, zwp_virtual_keyboard_manager_v1_interface.name) == 0) {
     state->virt_kb_manager = wl_registry_bind(registry, name,
@@ -467,7 +470,6 @@ static void registry_handle_global_remove(void *data,
       if (state->output_name[i] == name) {
         struct drawable_layer *layer = state->layer[i];
         zwlr_layer_surface_v1_destroy(layer->layer_surface);
-        zwlr_virtual_pointer_v1_destroy(layer->virt_pointer);
         wl_output_release(state->output[i]);
         state->output[i] = NULL;
         state->output_name[i] = 0;
@@ -827,22 +829,6 @@ static void allocate_drawable_layer(struct disp_state *state,
   zwlr_layer_surface_v1_set_anchor(layer->layer_surface,
     ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
   wl_surface_commit(layer->surface);
-
-  /* Annoyingly, we have to re-create ALL the virtual pointers any time a
-   * monitor is added, or else (at least on labwc) you'll end up with
-   * virtual pointers that span the entire global compositor space, thus
-   * resulting in very weird discrepencies between virtual pointer and real
-   * pointer location. */
-  for (int32_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
-    if (state->layer[i]) {
-      if (layer->virt_pointer) {
-        zwlr_virtual_pointer_v1_destroy(layer->virt_pointer);
-      }
-      layer->virt_pointer
-        = zwlr_virtual_pointer_manager_v1_create_virtual_pointer_with_output(
-        state->virt_pointer_manager, NULL, layer->output);
-    }
-  }
 }
 
 static void damage_surface_enh(struct wl_surface *surface, int32_t x,
@@ -852,8 +838,7 @@ static void damage_surface_enh(struct wl_surface *surface, int32_t x,
   wl_surface_damage_buffer(surface, x, y, width, height);
 }
 
-static struct screen_local_coord update_virtual_cursor(
-  uint32_t ts_milliseconds) {
+static void update_virtual_cursor(uint32_t ts_milliseconds) {
   struct screen_local_coord prev_coord_data = abs_coord_to_screen_local_coord(
     (int32_t) prev_cursor_x, (int32_t) prev_cursor_y);
   struct screen_local_coord coord_data = { 0 };
@@ -981,12 +966,10 @@ static struct screen_local_coord update_virtual_cursor(
 
   state.layer[prev_coord_data.output_idx]->frame_pending = true;
   state.layer[coord_data.output_idx]->frame_pending = true;
+  printf("(%f, %f)\n", cursor_x, cursor_y);
   zwlr_virtual_pointer_v1_motion_absolute(
-    state.layer[coord_data.output_idx]->virt_pointer,
-    ts_milliseconds, (uint32_t) coord_data.x, (uint32_t) coord_data.y,
-    state.layer[coord_data.output_idx]->width,
-    state.layer[coord_data.output_idx]->height);
-  return coord_data;
+    state.virt_pointer, ts_milliseconds, (uint32_t) cursor_x,
+    (uint32_t) cursor_y, state.global_space_width, state.global_space_height);
 }
 
 static void handle_libinput_event(enum libinput_event_type ev_type) {
@@ -997,14 +980,7 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
   unsigned int ts_milliseconds = ts.tv_sec * 1000;
   ts_milliseconds += (ts.tv_nsec / 1000000);
 
-  struct screen_local_coord coord_data = { 0 };
   struct libinput_event *li_event = libinput_get_event(li);
-
-  if (ev_type != LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE
-    && ev_type != LIBINPUT_EVENT_POINTER_MOTION) {
-    coord_data = abs_coord_to_screen_local_coord((int32_t) cursor_x,
-      (int32_t) cursor_y);
-  }
 
   if (ev_type == LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE) {
     mouse_event_handled = true;
@@ -1018,7 +994,7 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
     prev_cursor_y = cursor_y;
     cursor_x = abs_x;
     cursor_y = abs_y;
-    coord_data = update_virtual_cursor(ts_milliseconds);
+    update_virtual_cursor(ts_milliseconds);
 
   } else if (ev_type == LIBINPUT_EVENT_POINTER_MOTION) {
     mouse_event_handled = true;
@@ -1036,7 +1012,7 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
       cursor_x = state.global_space_width - 1;
     if (cursor_y > state.global_space_height - 1)
       cursor_y = state.global_space_height - 1;
-    coord_data = update_virtual_cursor(ts_milliseconds);
+    update_virtual_cursor(ts_milliseconds);
 
   } else if (ev_type == LIBINPUT_EVENT_POINTER_BUTTON) {
     mouse_event_handled = true;
@@ -1045,24 +1021,17 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
     uint32_t button_code = libinput_event_pointer_get_button(pointer_event);
     enum libinput_button_state button_state
       = libinput_event_pointer_get_button_state(pointer_event);
-    if (coord_data.valid) {
-      if (!state.layer[coord_data.output_idx]) {
-        fprintf(stderr,
-          "FATAL ERROR: Current coordinate data points to an unallocated drawable layer!\n");
-        exit(1);
-      }
-      if (button_state == LIBINPUT_BUTTON_STATE_PRESSED) {
-        /* Both libinput and zwlr_virtual_pointer_v1 use evdev event codes to
-         * identify the button pressed, so we can just pass the data from
-         * libinput straight through */
-        zwlr_virtual_pointer_v1_button(
-          state.layer[coord_data.output_idx]->virt_pointer,
-          ts_milliseconds, button_code, WL_POINTER_BUTTON_STATE_PRESSED);
-      } else {
-        zwlr_virtual_pointer_v1_button(
-          state.layer[coord_data.output_idx]->virt_pointer,
-          ts_milliseconds, button_code, WL_POINTER_BUTTON_STATE_RELEASED);
-      }
+    if (button_state == LIBINPUT_BUTTON_STATE_PRESSED) {
+      /* Both libinput and zwlr_virtual_pointer_v1 use evdev event codes to
+       * identify the button pressed, so we can just pass the data from
+       * libinput straight through */
+      zwlr_virtual_pointer_v1_button(
+        state.virt_pointer, ts_milliseconds, button_code,
+        WL_POINTER_BUTTON_STATE_PRESSED);
+    } else {
+      zwlr_virtual_pointer_v1_button(
+        state.virt_pointer, ts_milliseconds, button_code,
+        WL_POINTER_BUTTON_STATE_RELEASED);
     }
 
   } else if (ev_type == LIBINPUT_EVENT_POINTER_SCROLL_WHEEL
@@ -1075,75 +1044,59 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
       LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL);
     int horiz_scroll_present = libinput_event_pointer_has_axis(pointer_event,
       LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL);
-    if (coord_data.valid) {
-      if (!state.layer[coord_data.output_idx]) {
-        fprintf(stderr,
-          "FATAL ERROR: Current coordinate data points to an unallocated drawable layer!\n");
-        exit(1);
-      }
 
-      if (vert_scroll_present) {
-        double vert_scroll_value = libinput_event_pointer_get_scroll_value(
-          pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL);
-        if (vert_scroll_value == 0) {
-          zwlr_virtual_pointer_v1_axis_stop(
-            state.layer[coord_data.output_idx]->virt_pointer,
-            ts_milliseconds, WL_POINTER_AXIS_VERTICAL_SCROLL);
-        } else {
-          zwlr_virtual_pointer_v1_axis(
-            state.layer[coord_data.output_idx]->virt_pointer,
-            ts_milliseconds, WL_POINTER_AXIS_VERTICAL_SCROLL,
-            wl_fixed_from_double(vert_scroll_value));
-        }
-        switch (ev_type) {
-          case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
-            zwlr_virtual_pointer_v1_axis_source(
-              state.layer[coord_data.output_idx]->virt_pointer,
-              WL_POINTER_AXIS_SOURCE_WHEEL);
-            break;
-          case LIBINPUT_EVENT_POINTER_SCROLL_FINGER:
-            zwlr_virtual_pointer_v1_axis_source(
-              state.layer[coord_data.output_idx]->virt_pointer,
-              WL_POINTER_AXIS_SOURCE_FINGER);
-            break;
-          case LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS:
-            zwlr_virtual_pointer_v1_axis_source(
-              state.layer[coord_data.output_idx]->virt_pointer,
-              WL_POINTER_AXIS_SOURCE_CONTINUOUS);
-            break;
-        }
+    if (vert_scroll_present) {
+      double vert_scroll_value = libinput_event_pointer_get_scroll_value(
+        pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_VERTICAL);
+      if (vert_scroll_value == 0) {
+        zwlr_virtual_pointer_v1_axis_stop(
+          state.virt_pointer, ts_milliseconds,
+          WL_POINTER_AXIS_VERTICAL_SCROLL);
+      } else {
+        zwlr_virtual_pointer_v1_axis(state.virt_pointer, ts_milliseconds,
+          WL_POINTER_AXIS_VERTICAL_SCROLL,
+          wl_fixed_from_double(vert_scroll_value));
       }
+      switch (ev_type) {
+        case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
+          zwlr_virtual_pointer_v1_axis_source(state.virt_pointer,
+            WL_POINTER_AXIS_SOURCE_WHEEL);
+          break;
+        case LIBINPUT_EVENT_POINTER_SCROLL_FINGER:
+          zwlr_virtual_pointer_v1_axis_source(state.virt_pointer,
+            WL_POINTER_AXIS_SOURCE_FINGER);
+          break;
+        case LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS:
+          zwlr_virtual_pointer_v1_axis_source(state.virt_pointer,
+            WL_POINTER_AXIS_SOURCE_CONTINUOUS);
+          break;
+      }
+    }
 
-      if (horiz_scroll_present) {
-        double horiz_scroll_value = libinput_event_pointer_get_scroll_value(
-          pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL);
-        if (horiz_scroll_value == 0) {
-          zwlr_virtual_pointer_v1_axis_stop(
-            state.layer[coord_data.output_idx]->virt_pointer,
-            ts_milliseconds, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
-        } else {
-          zwlr_virtual_pointer_v1_axis(
-            state.layer[coord_data.output_idx]->virt_pointer,
-            ts_milliseconds, WL_POINTER_AXIS_HORIZONTAL_SCROLL,
-            wl_fixed_from_double(horiz_scroll_value));
-        }
-        switch (ev_type) {
-          case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
-            zwlr_virtual_pointer_v1_axis_source(
-              state.layer[coord_data.output_idx]->virt_pointer,
-              WL_POINTER_AXIS_SOURCE_WHEEL);
-            break;
-          case LIBINPUT_EVENT_POINTER_SCROLL_FINGER:
-            zwlr_virtual_pointer_v1_axis_source(
-              state.layer[coord_data.output_idx]->virt_pointer,
-              WL_POINTER_AXIS_SOURCE_FINGER);
-            break;
-          case LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS:
-            zwlr_virtual_pointer_v1_axis_source(
-              state.layer[coord_data.output_idx]->virt_pointer,
-              WL_POINTER_AXIS_SOURCE_CONTINUOUS);
-            break;
-        }
+    if (horiz_scroll_present) {
+      double horiz_scroll_value = libinput_event_pointer_get_scroll_value(
+        pointer_event, LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL);
+      if (horiz_scroll_value == 0) {
+        zwlr_virtual_pointer_v1_axis_stop(state.virt_pointer,
+          ts_milliseconds, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
+      } else {
+        zwlr_virtual_pointer_v1_axis(state.virt_pointer,
+          ts_milliseconds, WL_POINTER_AXIS_HORIZONTAL_SCROLL,
+          wl_fixed_from_double(horiz_scroll_value));
+      }
+      switch (ev_type) {
+        case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
+          zwlr_virtual_pointer_v1_axis_source(state.virt_pointer,
+            WL_POINTER_AXIS_SOURCE_WHEEL);
+          break;
+        case LIBINPUT_EVENT_POINTER_SCROLL_FINGER:
+          zwlr_virtual_pointer_v1_axis_source(state.virt_pointer,
+            WL_POINTER_AXIS_SOURCE_FINGER);
+          break;
+        case LIBINPUT_EVENT_POINTER_SCROLL_CONTINUOUS:
+          zwlr_virtual_pointer_v1_axis_source(state.virt_pointer,
+            WL_POINTER_AXIS_SOURCE_CONTINUOUS);
+          break;
       }
     }
 
@@ -1177,8 +1130,7 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
   }
 
   if (mouse_event_handled) {
-    zwlr_virtual_pointer_v1_frame(
-      state.layer[coord_data.output_idx]->virt_pointer);
+    zwlr_virtual_pointer_v1_frame(state.virt_pointer);
   }
   libinput_event_destroy(li_event);
 }

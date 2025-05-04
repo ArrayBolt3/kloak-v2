@@ -27,8 +27,6 @@ struct drawable_layer {
   /* Layer shell stuff */
   struct zwlr_layer_surface_v1 *layer_surface;
   bool layer_surface_configured;
-  /* Virtual pointer */
-  struct zwlr_virtual_pointer_v1 *virt_pointer;
   /* Sync state */
   bool frame_released;
   bool frame_pending;
@@ -79,6 +77,7 @@ struct disp_state {
   struct zwlr_virtual_pointer_manager_v1 *virt_pointer_manager;
   struct zwp_virtual_keyboard_manager_v1 *virt_kb_manager;
   struct zwp_virtual_keyboard_v1 *virt_kb;
+  struct zwlr_virtual_pointer_v1 *virt_pointer;
   bool virt_kb_keymap_set;
   struct xkb_context *xkb_ctx;
   struct xkb_keymap *xkb_keymap;
@@ -168,8 +167,7 @@ static void allocate_drawable_layer(struct disp_state *,
   struct drawable_layer *, struct wl_output *);
 static void damage_surface_enh(struct wl_surface *, int32_t, int32_t, int32_t,
   int32_t);
-static struct screen_local_coord update_virtual_cursor(
-  uint32_t ts_milliseconds);
+static void update_virtual_cursor(uint32_t);
 static void handle_libinput_event(enum libinput_event_type);
 
 /****************************/
