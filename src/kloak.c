@@ -18,6 +18,7 @@
 #include <dirent.h>
 #include <time.h>
 #include <math.h>
+#include <sys/queue.h>
 
 #include <wayland-client.h>
 #include "xdg-output-protocol.h"
@@ -36,38 +37,41 @@
 /* global variables */
 /********************/
 
-double cursor_x = 0;
-double cursor_y = 0;
-double prev_cursor_x = 0;
-double prev_cursor_y = 0;
+static double cursor_x = 0;
+static double cursor_y = 0;
+static double prev_cursor_x = 0;
+static double prev_cursor_y = 0;
 
-struct disp_state state = { 0 };
-struct libinput *li;
-struct udev *udev_ctx;
+static struct disp_state state = { 0 };
+static struct libinput *li;
+static struct udev *udev_ctx;
 
-struct pollfd *ev_fds;
+static struct pollfd *ev_fds;
+
+static int64_t prev_release_time = 0;
+static int max_delay = DEFAULT_MAX_DELAY_MS;
+static TAILQ_HEAD(tailhead, li_packet) head;
+static int64_t next_mouse_move_time = 0;
+
+int randfd;
 
 /*********************/
 /* utility functions */
 /*********************/
 
-static void randname(char *buf, size_t len) {
-  int randfd = open("/dev/urandom", O_RDONLY);
-  if (randfd < 0) {
-    fprintf(stderr, "FATAL ERROR: Could not open /dev/urandom: %s\n",
-      strerror(errno));
+static void read_random(char *buf, size_t len) {
+  if (read(randfd, buf, len) < len) {
+    fprintf(stderr,
+      "FATAL ERROR: Could not read %d byte(s) from /dev/urandom!", len);
     exit(1);
   }
+}
 
+static void randname(char *buf, size_t len) {
   char randchar = 0;
   for (size_t i = 0; i < len; ++i) {
     do {
-      if (read(randfd, &randchar, 1) < 1) {
-        fprintf(stderr,
-          "FATAL ERROR: Could not read byte from /dev/urandom: %s\n",
-          strerror(errno));
-        exit(1);
-      }
+      read_random(&randchar, 1);
       if (randchar & 0x80)
         randchar ^= 0x80;
     } while (randchar >= (127 - 127 % 52));
@@ -79,12 +83,6 @@ static void randname(char *buf, size_t len) {
       randchar += 71;
     }
     buf[i] = randchar;
-  }
-
-  if (close(randfd) == -1) {
-    fprintf(stderr, "FATAL ERROR: Could not close /dev/urandom: %s\n",
-      strerror(errno));
-    exit(1);
   }
 }
 
@@ -121,6 +119,29 @@ static int create_shm_file(size_t size) {
   }
 
   return fd;
+}
+
+static int64_t current_time_ms(void) {
+  struct timespec spec;
+  clock_gettime(CLOCK_MONOTONIC, &spec);
+  return (spec.tv_sec) * 1000 + (spec.tv_nsec) / 1000000;
+}
+
+static int64_t random_between(int64_t lower, int64_t upper) {
+  int64_t maxval;
+  union rand_int64 randval;
+  /* default to max if the interval is not valid */
+  if (lower >= upper) {
+    return upper;
+  }
+
+  maxval = upper - lower + 1;
+  do {
+    read_random(randval.raw, sizeof(uint64_t));
+  } while (randval.val >= (INT64_MAX - INT64_MAX - maxval));
+
+  randval.val %= maxval;
+  return lower + randval.val;
 }
 
 static void recalc_global_space(struct disp_state * state, bool allow_gaps) {
@@ -966,20 +987,11 @@ static void update_virtual_cursor(uint32_t ts_milliseconds) {
 
   state.layer[prev_coord_data.output_idx]->frame_pending = true;
   state.layer[coord_data.output_idx]->frame_pending = true;
-  printf("(%f, %f)\n", cursor_x, cursor_y);
-  zwlr_virtual_pointer_v1_motion_absolute(
-    state.virt_pointer, ts_milliseconds, (uint32_t) cursor_x,
-    (uint32_t) cursor_y, state.global_space_width, state.global_space_height);
 }
 
 static void handle_libinput_event(enum libinput_event_type ev_type,
-  struct libinput_event *li_event) {
+  struct libinput_event *li_event, uint32_t ts_milliseconds) {
   bool mouse_event_handled = false;
-
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  unsigned int ts_milliseconds = ts.tv_sec * 1000;
-  ts_milliseconds += (ts.tv_nsec / 1000000);
 
   if (ev_type == LIBINPUT_EVENT_DEVICE_ADDED) {
     struct libinput_device *new_dev = libinput_event_get_device(li_event);
@@ -987,38 +999,6 @@ static void handle_libinput_event(enum libinput_event_type ev_type,
     if (can_tap) {
       libinput_device_config_tap_set_enabled(new_dev, LIBINPUT_CONFIG_TAP_ENABLED);
     }
-  } else if (ev_type == LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE) {
-    mouse_event_handled = true;
-    struct libinput_event_pointer *pointer_event
-      = libinput_event_get_pointer_event(li_event);
-    double abs_x = libinput_event_pointer_get_absolute_x_transformed(
-      pointer_event, state.global_space_width);
-    double abs_y = libinput_event_pointer_get_absolute_y_transformed(
-      pointer_event, state.global_space_height);
-    prev_cursor_x = cursor_x;
-    prev_cursor_y = cursor_y;
-    cursor_x = abs_x;
-    cursor_y = abs_y;
-    update_virtual_cursor(ts_milliseconds);
-
-  } else if (ev_type == LIBINPUT_EVENT_POINTER_MOTION) {
-    mouse_event_handled = true;
-    struct libinput_event_pointer *pointer_event
-      = libinput_event_get_pointer_event(li_event);
-    double rel_x = libinput_event_pointer_get_dx(pointer_event);
-    double rel_y = libinput_event_pointer_get_dy(pointer_event);
-    prev_cursor_x = cursor_x;
-    prev_cursor_y = cursor_y;
-    cursor_x += rel_x;
-    cursor_y += rel_y;
-    if (cursor_x < 0) cursor_x = 0;
-    if (cursor_y < 0) cursor_y = 0;
-    if (cursor_x > state.global_space_width - 1)
-      cursor_x = state.global_space_width - 1;
-    if (cursor_y > state.global_space_height - 1)
-      cursor_y = state.global_space_height - 1;
-    update_virtual_cursor(ts_milliseconds);
-
   } else if (ev_type == LIBINPUT_EVENT_POINTER_BUTTON) {
     mouse_event_handled = true;
     struct libinput_event_pointer *pointer_event
@@ -1140,15 +1120,88 @@ static void handle_libinput_event(enum libinput_event_type ev_type,
   libinput_event_destroy(li_event);
 }
 
-static void schedule_libinput_event(enum libinput_event_type ev_type,
+static void schedule_libinput_event(enum libinput_event_type li_event_type,
   struct libinput_event *li_event) {
+  int64_t current_time = current_time_ms();
+
+  if (li_event_type == LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE) {
+    struct libinput_event_pointer *pointer_event
+      = libinput_event_get_pointer_event(li_event);
+    double abs_x = libinput_event_pointer_get_absolute_x_transformed(
+      pointer_event, state.global_space_width);
+    double abs_y = libinput_event_pointer_get_absolute_y_transformed(
+      pointer_event, state.global_space_height);
+    prev_cursor_x = cursor_x;
+    prev_cursor_y = cursor_y;
+    cursor_x = abs_x;
+    cursor_y = abs_y;
+    update_virtual_cursor((uint32_t) current_time);
+    return;
+
+  } else if (li_event_type == LIBINPUT_EVENT_POINTER_MOTION) {
+    struct libinput_event_pointer *pointer_event
+      = libinput_event_get_pointer_event(li_event);
+    double rel_x = libinput_event_pointer_get_dx(pointer_event);
+    double rel_y = libinput_event_pointer_get_dy(pointer_event);
+    prev_cursor_x = cursor_x;
+    prev_cursor_y = cursor_y;
+    cursor_x += rel_x;
+    cursor_y += rel_y;
+    if (cursor_x < 0) cursor_x = 0;
+    if (cursor_y < 0) cursor_y = 0;
+    if (cursor_x > state.global_space_width - 1)
+      cursor_x = state.global_space_width - 1;
+    if (cursor_y > state.global_space_height - 1)
+      cursor_y = state.global_space_height - 1;
+    update_virtual_cursor((uint32_t) current_time);
+    return;
+  }
+
+  int64_t lower_bound = min(max(prev_release_time - current_time, 0), max_delay);
+  int64_t random_delay = random_between(lower_bound, max_delay);
+  struct li_packet *ev_packet = malloc(sizeof(struct li_packet));
+  if (ev_packet == NULL) {
+    fprintf(stderr,
+      "FATAL ERROR: Could not allocate memory for libinput event packet!\n");
+    exit(1);
+  }
+  ev_packet->li_event = li_event;
+  ev_packet->li_event_type = li_event_type;
+  ev_packet->sched_time = current_time + random_delay;
+  TAILQ_INSERT_TAIL(&head, ev_packet, entries);
+  prev_release_time = ev_packet->sched_time;
+}
+
+static void release_scheduled_libinput_events(void) {
+  int64_t current_time = current_time_ms();
+  struct li_packet *packet;
+  while ((packet = TAILQ_FIRST(&head))
+    && (current_time >= packet->sched_time)) {
+    handle_libinput_event(packet->li_event_type, packet->li_event,
+      (uint32_t) packet->sched_time);
+    TAILQ_REMOVE(&head, packet, entries);
+    free(packet);
+  }
 }
 
 /****************************/
 /* initialization functions */
 /****************************/
 
-static void applayer_wayland_init() {
+static void applayer_random_init(void) {
+  randfd = open("/dev/urandom", O_RDONLY);
+  if (randfd < 0) {
+    fprintf(stderr, "FATAL ERROR: Could not open /dev/urandom: %s\n",
+      strerror(errno));
+    exit(1);
+  }
+
+  int64_t current_time = current_time_ms();
+  next_mouse_move_time = random_between(current_time,
+    current_time + max_delay);
+}
+
+static void applayer_wayland_init(void) {
   /* Technically we also initialize xkbcommon in here but it's only involved
    * because it turned out to be important for sending key events to
    * Wayland. */
@@ -1192,14 +1245,15 @@ static void applayer_wayland_init() {
   }
 }
 
-static void applayer_libinput_init() {
+static void applayer_libinput_init(void) {
   udev_ctx = udev_new();
   li = libinput_udev_create_context(&li_interface, NULL, udev_ctx);
   /* TODO: Allow customizing the seat with a command line arg */
   libinput_udev_assign_seat(li, "seat0");
+  TAILQ_INIT(&head);
 }
 
-static void applayer_poll_init() {
+static void applayer_poll_init(void) {
   ev_fds = calloc(2, sizeof(struct pollfd));
   ev_fds[0].fd = state.display_fd;
   ev_fds[0].events = POLLIN;
@@ -1214,6 +1268,7 @@ static void applayer_poll_init() {
 /**********/
 
 int main(int argc, char **argv) {
+  applayer_random_init();
   applayer_wayland_init();
   applayer_libinput_init();
   applayer_poll_init();
@@ -1228,8 +1283,10 @@ int main(int argc, char **argv) {
       if (next_ev_type == LIBINPUT_EVENT_NONE)
         break;
       struct libinput_event *li_event = libinput_get_event(li);
-      handle_libinput_event(next_ev_type, li_event);
+      schedule_libinput_event(next_ev_type, li_event);
     }
+
+    release_scheduled_libinput_events();
 
     for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
       if (!state.layer[i])
@@ -1240,6 +1297,25 @@ int main(int argc, char **argv) {
     wl_display_flush(state.display);
 
     poll(ev_fds, 2, POLL_TIMEOUT_MS);
+
+    /* TODO: The current mouse update mechanism results in event reordering,
+     * where button down and button up events in clicks can end up registering
+     * in an incorrect mouse position. Fixing this will require adding mouse
+     * movement events to the event queue, but currently the event queue is
+     * only designed to hold libinput events, and sadly libinput pointer
+     * events are opaque structs so we can't just reach in and tweak their
+     * parameters as appropriate for our use case. Some changes to the
+     * li_packet struct will be needed to fix this. */
+    /* TODO: Hovering is broken for... some reason. */
+    int64_t current_time = current_time_ms();
+    if (current_time >= next_mouse_move_time) {
+      zwlr_virtual_pointer_v1_motion_absolute(
+        state.virt_pointer, (uint32_t) current_time_ms(), (uint32_t) cursor_x,
+        (uint32_t) cursor_y, state.global_space_width,
+        state.global_space_height);
+      next_mouse_move_time = random_between(current_time,
+        current_time + max_delay);
+    }
 
     if (ev_fds[0].revents & POLLIN) {
       wl_display_read_events(state.display);

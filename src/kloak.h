@@ -12,6 +12,14 @@
 #define POLL_TIMEOUT_MS 1
 #define DEFAULT_MAX_DELAY_MS 100
 
+#ifndef min
+#define min(a, b) ( ((a) < (b)) ? (a) : (b) )
+#endif
+
+#ifndef max
+#define max(a, b) ( ((a) > (b)) ? (a) : (b) )
+#endif
+
 /*******************/
 /* core structures */
 /*******************/
@@ -56,6 +64,13 @@ struct coord {
   int32_t y;
 };
 
+struct li_packet {
+  struct libinput_event * li_event;
+  enum libinput_event_type li_event_type;
+  int64_t sched_time;
+  TAILQ_ENTRY(li_packet) entries;
+};
+
 struct disp_state {
   /* miscellaneous guts */
   struct wl_display *display;
@@ -91,13 +106,24 @@ struct disp_state {
   struct drawable_layer *layer[MAX_DRAWABLE_LAYERS];
 };
 
+/***************/
+/* core unions */
+/***************/
+
+union rand_int64 {
+  uint64_t val;
+  char raw[sizeof(uint64_t)];
+};
+
 /*********************/
 /* utility functions */
 /*********************/
 
-static void panic(const char *, int);
+static void read_random(char *buf, size_t len);
 static void randname(char *, size_t);
 static int create_shm_file(size_t);
+static int64_t current_time_ms(void);
+static int64_t random_between(int64_t, int64_t);
 static void recalc_global_space(struct disp_state *, bool);
 static struct screen_local_coord abs_coord_to_screen_local_coord(int32_t,
   int32_t);
@@ -171,17 +197,19 @@ static void damage_surface_enh(struct wl_surface *, int32_t, int32_t, int32_t,
   int32_t);
 static void update_virtual_cursor(uint32_t);
 static void handle_libinput_event(enum libinput_event_type,
-  struct libinput_event *);
+  struct libinput_event *, uint32_t);
 static void schedule_libinput_event(enum libinput_event_type,
   struct libinput_event *);
+static void release_scheduled_libinput_events(void);
 
 /****************************/
 /* initialization functions */
 /****************************/
 
-static void applayer_wayland_init();
-static void applayer_libinput_init();
-static void applayer_poll_init();
+static void applayer_random_init(void);
+static void applayer_wayland_init(void);
+static void applayer_libinput_init(void);
+static void applayer_poll_init(void);
 
 /*********************/
 /* wayland callbacks */
