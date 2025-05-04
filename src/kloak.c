@@ -123,7 +123,7 @@ static int create_shm_file(size_t size) {
   return fd;
 }
 
-static void recalc_global_space(struct disp_state * state) {
+static void recalc_global_space(struct disp_state * state, bool allow_gaps) {
   uint32_t ul_corner_x = UINT32_MAX;
   uint32_t ul_corner_y = UINT32_MAX;
   uint32_t br_corner_x = 0;
@@ -208,6 +208,19 @@ static void recalc_global_space(struct disp_state * state) {
   }
 
   if (conn_screen_list_len != screen_list_len) {
+    if (allow_gaps) {
+      /* We temporarily allow gaps between screens if the user just unplugged
+       * a display, since if there are gaps between the screens when this is
+       * done, the compositor will (or at least *should*) immediately "squish"
+       * the remaining screens back together. If it doesn't do this, the
+       * user will find that the virtual cursor (and therefore the real
+       * cursor) is stuck on one group of screens and can't cross the gap to
+       * get to the others. There's very little we can do to detect that
+       * condition other than crude polling, so for now we just assume the
+       * compositor does the right thing. (labwc at the very least does indeed
+       * do the right thing here.) */
+      return;
+    }
     fprintf(stderr,
       "FATAL ERROR: Multiple screens are attached and gaps are present between them. kloak cannot operate in this configuration.\n");
     exit(1);
@@ -375,6 +388,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
       if (!state->layer[i]) {
         state->output[i] = wl_registry_bind(registry, name,
           &wl_output_interface, 4);
+        state->output_name[i] = name;
         state->layer[i] = malloc(sizeof(struct drawable_layer));
         memset(state->layer[i], 0, sizeof(struct drawable_layer));
         state->layer[i]->frame_released = true;
@@ -450,15 +464,18 @@ static void registry_handle_global_remove(void *data,
   struct disp_state *state = data;
   for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
     if (state->layer[i]) {
-      if (wl_proxy_get_id((struct wl_proxy *) state->output[i]) == name) {
+      if (state->output_name[i] == name) {
         struct drawable_layer *layer = state->layer[i];
-        wl_output_release(state->output[i]);
-        zxdg_output_v1_destroy(state->xdg_output[i]);
-        free(state->output_geometry[i]);
-        state->output[i] = NULL;
-        wl_surface_destroy(layer->surface);
         zwlr_layer_surface_v1_destroy(layer->layer_surface);
         zwlr_virtual_pointer_v1_destroy(layer->virt_pointer);
+        wl_output_release(state->output[i]);
+        state->output[i] = NULL;
+        state->output_name[i] = 0;
+        zxdg_output_v1_destroy(state->xdg_output[i]);
+        state->xdg_output[i] = NULL;
+        free(state->output_geometry[i]);
+        state->output_geometry[i] = NULL;
+        wl_surface_destroy(layer->surface);
         if (layer->pixbuf != NULL) {
           munmap(layer->pixbuf, layer->size);
         }
@@ -467,7 +484,7 @@ static void registry_handle_global_remove(void *data,
         }
         free(layer);
         state->layer[i] = NULL;
-        recalc_global_space(state);
+        recalc_global_space(state, true);
         break;
       }
     }
@@ -620,7 +637,7 @@ static void wl_output_info_done(void *data, struct wl_output *output) {
         && geometry->height == 0)
         return;
       state->output_geometry[i]->init_done = true;
-      recalc_global_space(state);
+      recalc_global_space(state, false);
       break;
     }
   }
@@ -811,9 +828,21 @@ static void allocate_drawable_layer(struct disp_state *state,
     ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
   wl_surface_commit(layer->surface);
 
-  layer->virt_pointer
-    = zwlr_virtual_pointer_manager_v1_create_virtual_pointer_with_output(
-    state->virt_pointer_manager, NULL, layer->output);
+  /* Annoyingly, we have to re-create ALL the virtual pointers any time a
+   * monitor is added, or else (at least on labwc) you'll end up with
+   * virtual pointers that span the entire global compositor space, thus
+   * resulting in very weird discrepencies between virtual pointer and real
+   * pointer location. */
+  for (int32_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
+    if (state->layer[i]) {
+      if (layer->virt_pointer) {
+        zwlr_virtual_pointer_v1_destroy(layer->virt_pointer);
+      }
+      layer->virt_pointer
+        = zwlr_virtual_pointer_manager_v1_create_virtual_pointer_with_output(
+        state->virt_pointer_manager, NULL, layer->output);
+    }
+  }
 }
 
 static void damage_surface_enh(struct wl_surface *surface, int32_t x,
@@ -1023,7 +1052,7 @@ static void handle_libinput_event(enum libinput_event_type ev_type) {
         exit(1);
       }
       if (button_state == LIBINPUT_BUTTON_STATE_PRESSED) {
-        /* Both libinput and zwlr_virtual_pointer_v1 use evdev devent codes to
+        /* Both libinput and zwlr_virtual_pointer_v1 use evdev event codes to
          * identify the button pressed, so we can just pass the data from
          * libinput straight through */
         zwlr_virtual_pointer_v1_button(

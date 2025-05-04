@@ -69,6 +69,7 @@ struct disp_state {
   bool seat_set;
   struct wl_keyboard *kb;
   struct wl_output *output[MAX_DRAWABLE_LAYERS];
+  int output_name[MAX_DRAWABLE_LAYERS];
   struct zxdg_output_manager_v1 *xdg_output_manager;
   struct zxdg_output_v1 *xdg_output[MAX_DRAWABLE_LAYERS];
   struct output_geometry *output_geometry[MAX_DRAWABLE_LAYERS];
@@ -96,7 +97,7 @@ struct disp_state {
 static void panic(const char *, int);
 static void randname(char *, size_t);
 static int create_shm_file(size_t);
-static void recalc_global_space(struct disp_state *);
+static void recalc_global_space(struct disp_state *, bool);
 static struct screen_local_coord abs_coord_to_screen_local_coord(int32_t,
   int32_t);
 static struct coord screen_local_coord_to_abs_coord(uint32_t, uint32_t,
