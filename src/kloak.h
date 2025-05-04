@@ -11,6 +11,7 @@
 #define CURSOR_RADIUS 15
 #define POLL_TIMEOUT_MS 1
 #define DEFAULT_MAX_DELAY_MS 100
+#define DEFAULT_STARTUP_TIMEOUT_MS 500
 
 #ifndef min
 #define min(a, b) ( ((a) < (b)) ? (a) : (b) )
@@ -24,6 +25,12 @@
 /* core structures */
 /*******************/
 
+/*
+ * Defines a screen-local layer that can be drawn on. Each screen has one
+ * drawable layer, the virtual cursor is drawn on this. The layer will be
+ * created using layer_shell and will appear on top of all other surfaces if
+ * at all possible.
+ */
 struct drawable_layer {
   struct wl_output *output;
   struct wl_buffer *buffer;
@@ -44,6 +51,9 @@ struct drawable_layer {
   int32_t last_drawn_cursor_y;
 };
 
+/*
+ * Defines the location and size of a display in compositor-global space.
+ */
 struct output_geometry {
   int32_t x;
   int32_t y;
@@ -52,6 +62,10 @@ struct output_geometry {
   bool init_done;
 };
 
+/*
+ * Defines a point in screen-local space, along with which screen the point is
+ * located on.
+ */
 struct screen_local_coord {
   int32_t x;
   int32_t y;
@@ -59,20 +73,42 @@ struct screen_local_coord {
   bool valid;
 };
 
+/*
+ * Defines a point in no particular space.
+ */
 struct coord {
   int32_t x;
   int32_t y;
 };
 
-struct li_packet {
+/*
+ * Defines a buffered input event. Two types of events are supported, mouse
+ * movement events and libinput events. libinput events can be any arbitrary
+ * event supported by libinput. Mouse movement events are defined as a cursor
+ * position in compositor global space. Both kinds of events have a scheduled
+ * release time. An `entries` field is included to allow buffered events to be
+ * stored in a tail queue.
+ */
+struct input_packet {
+  bool is_libinput;
+
+  /* libinput-specific bits */
   struct libinput_event * li_event;
   enum libinput_event_type li_event_type;
+
+  /* mouse movement bits */
+  uint32_t cursor_x;
+  uint32_t cursor_y;
+
+  /* generic bits */
   int64_t sched_time;
-  TAILQ_ENTRY(li_packet) entries;
+  TAILQ_ENTRY(input_packet) entries;
 };
 
+/*
+ * Monolithic Wayland state object.
+ */
 struct disp_state {
-  /* miscellaneous guts */
   struct wl_display *display;
   int display_fd;
   struct wl_registry *registry;
@@ -83,11 +119,11 @@ struct disp_state {
   uint32_t seat_caps;
   bool seat_set;
   struct wl_keyboard *kb;
-  struct wl_output *output[MAX_DRAWABLE_LAYERS];
-  int output_name[MAX_DRAWABLE_LAYERS];
+  struct wl_output *outputs[MAX_DRAWABLE_LAYERS];
+  int output_names[MAX_DRAWABLE_LAYERS];
   struct zxdg_output_manager_v1 *xdg_output_manager;
-  struct zxdg_output_v1 *xdg_output[MAX_DRAWABLE_LAYERS];
-  struct output_geometry *output_geometry[MAX_DRAWABLE_LAYERS];
+  struct zxdg_output_v1 *xdg_outputs[MAX_DRAWABLE_LAYERS];
+  struct output_geometry *output_geometries[MAX_DRAWABLE_LAYERS];
   uint32_t global_space_width;
   uint32_t global_space_height;
   struct zwlr_layer_shell_v1 *layer_shell;
@@ -101,16 +137,18 @@ struct disp_state {
   struct xkb_state *xkb_state;
   char *old_kb_map_shm;
   uint32_t old_kb_map_shm_size;
-
-  /* window and buffer properties */
-  struct drawable_layer *layer[MAX_DRAWABLE_LAYERS];
+  struct drawable_layer *layers[MAX_DRAWABLE_LAYERS];
 };
 
 /***************/
 /* core unions */
 /***************/
 
-union rand_int64 {
+/*
+ * A 64-bit unsigned integer with direct access to the constituent bytes. Used
+ * to allow getting 64-bit integers from /dev/urandom.
+ */
+union rand_uint64 {
   uint64_t val;
   char raw[sizeof(uint64_t)];
 };
@@ -119,97 +157,244 @@ union rand_int64 {
 /* utility functions */
 /*********************/
 
-static void read_random(char *buf, size_t len);
-static void randname(char *, size_t);
-static int create_shm_file(size_t);
+/*
+ * Reads the specified number of random bytes from /dev/urandom into the
+ * specified buffer. applayer_random_init must be called before this function
+ * will behave as intended.
+ */
+static void read_random(char * buf, size_t len);
+
+/*
+ * Populates a string with a number of random characters in the set [a-zA-Z].
+ */
+static void randname(char *buf, size_t len);
+
+/*
+ * Creates a mmap-able shared memory file of the specified size.
+ */
+static int create_shm_file(size_t size);
+
+/*
+ * Returns a monotonic 64-bit timestamp.
+ */
 static int64_t current_time_ms(void);
-static int64_t random_between(int64_t, int64_t);
-static void recalc_global_space(struct disp_state *, bool);
-static struct screen_local_coord abs_coord_to_screen_local_coord(int32_t,
-  int32_t);
-static struct coord screen_local_coord_to_abs_coord(uint32_t, uint32_t,
-  int32_t);
+
+/*
+ * Generates a random 64-bit number between the two specified numbers. Uses
+ * /dev/urandom as its source.
+ */
+static int64_t random_between(int64_t lower, int64_t upper);
+
+/*
+ * Calculates the size of the global compositor space from the geometries of
+ * the active displays. The function detects if there are gaps between the
+ * displays and aborts the program if so. If allow_gaps is set to true, gaps
+ * will not cause the program to abort, but the compositor global space values
+ * will not be updated if gaps are detected.
+ */
+static void recalc_global_space(struct disp_state * state, bool allow_gaps);
+
+/*
+ * Converts a set of coordinates in global compositor space to a set of
+ * coordinates in screen-local space.
+ */
+static struct screen_local_coord abs_coord_to_screen_local_coord(int32_t x,
+  int32_t y);
+
+/*
+ * Converts a set of coordinates in screen-local space to a set of coordinates
+ * in compositor-global space.
+ */
+static struct coord screen_local_coord_to_abs_coord(uint32_t x, uint32_t y,
+  int32_t output_idx);
+
+/*
+ * Takes two points that define a line on a 2d plane, and walks the specified
+ * number of pixels from the start point towards the "end" point. Note that
+ * you *can* walk past the end point, and that the end point is NOT guaranteed
+ * to be one of the values this function outputs.
+ */
 static struct coord traverse_line(struct coord start, struct coord end,
   int32_t pos);
-static void draw_block(uint32_t *, int32_t, int32_t, int32_t, int32_t,
-  int32_t, bool);
+
+/*
+ * Draws a virtual cursor block on the specified pixel buffer. If crosshair is
+ * set to true, crosshairs representing the cursor will be drawn in the block,
+ * otherwise the block will simply blank out anything that it is drawing over.
+ */
+static void draw_block(uint32_t * pixbuf, int32_t x, int32_t y,
+  int32_t layer_width, int32_t layer_height, int32_t rad, bool crosshair);
+
+/*
+ * Parse an option parameter as an unsigned integer.
+ */
+static int32_t parse_uintarg(const char *arg_name, const char *val);
+
+/*
+ * Sleeps for the specified number of milliseconds.
+ */
+static void sleep_ms(long ms);
 
 /********************/
 /* wayland handling */
 /********************/
 
-static void registry_handle_global(void *, struct wl_registry *, uint32_t,
-  const char *, uint32_t);
-static void registry_handle_global_remove(void *, struct wl_registry *,
-  uint32_t);
-static void seat_handle_name(void *, struct wl_seat *, const char *);
-static void seat_handle_capabilities(void *, struct wl_seat *, uint32_t);
-static void kb_handle_keymap(void *, struct wl_keyboard *, uint32_t, int32_t,
-  uint32_t);
-static void kb_handle_enter(void *, struct wl_keyboard *, uint32_t,
-  struct wl_surface *, struct wl_array *);
-static void kb_handle_leave(void *, struct wl_keyboard *, uint32_t,
-  struct wl_surface *);
-static void kb_handle_key(void *, struct wl_keyboard *, uint32_t, uint32_t,
-  uint32_t, uint32_t);
-static void kb_handle_modifiers(void *, struct wl_keyboard *, uint32_t,
-  uint32_t, uint32_t, uint32_t, uint32_t);
-static void kb_handle_repeat_info(void *, struct wl_keyboard *, int32_t,
-  int32_t);
-static void wl_buffer_release(void *, struct wl_buffer *);
-static void wl_output_handle_geometry(void *, struct wl_output *, int32_t,
-  int32_t, int32_t, int32_t, int32_t, const char *, const char *, int32_t);
-static void wl_output_handle_mode(void *, struct wl_output *, uint32_t,
-  int32_t, int32_t, int32_t);
-static void wl_output_info_done(void *, struct wl_output *);
-static void wl_output_handle_scale(void *, struct wl_output *, int32_t);
-static void wl_output_handle_name(void *, struct wl_output *, const char *);
-static void wl_output_handle_description(void *, struct wl_output *,
-  const char *);
-static void xdg_output_handle_logical_position(void *,
-  struct zxdg_output_v1 *, int32_t, int32_t);
-static void xdg_output_handle_logical_size(void *,
-  struct zxdg_output_v1 *, int32_t, int32_t);
-static void xdg_output_info_done(void *,
-  struct zxdg_output_v1 *);
-static void xdg_output_handle_name(void *,
-  struct zxdg_output_v1 *, const char *);
-static void xdg_output_handle_description(void *,
-  struct zxdg_output_v1 *, const char *);
-static void layer_surface_configure(void *, struct zwlr_layer_surface_v1 *,
-  uint32_t, uint32_t, uint32_t);
+static void registry_handle_global(void * data, struct wl_registry * registry,
+  uint32_t name, const char * interface, uint32_t version);
+static void registry_handle_global_remove(void *data,
+  struct wl_registry * registry, uint32_t name);
+static void seat_handle_name(void *data, struct wl_seat *seat,
+  const char *name);
+static void seat_handle_capabilities(void *data, struct wl_seat *seat,
+  uint32_t capabilities);
+static void kb_handle_keymap(void *data, struct wl_keyboard *kb,
+  uint32_t format, int32_t fd, uint32_t size);
+static void kb_handle_enter(void *data, struct wl_keyboard *kb,
+  uint32_t serial, struct wl_surface *surface, struct wl_array *keys);
+static void kb_handle_leave(void *data, struct wl_keyboard *kb,
+  uint32_t serial, struct wl_surface *surface);
+static void kb_handle_key(void *data, struct wl_keyboard *kb, uint32_t serial,
+  uint32_t time, uint32_t key, uint32_t state);
+static void kb_handle_modifiers(void *data, struct wl_keyboard *kb,
+  uint32_t serial, uint32_t mods_depressed, uint32_t mods_latched,
+  uint32_t mods_locked, uint32_t group);
+static void kb_handle_repeat_info(void *data, struct wl_keyboard *kb,
+  int32_t rate, int32_t delay);
+static void wl_buffer_release(void *data, struct wl_buffer * buffer);
+static void wl_output_handle_geometry(void *data, struct wl_output *output,
+  int32_t x, int32_t y, int32_t physical_width, int32_t physical_height,
+  int32_t subpixel, const char *make, const char *model, int32_t transform);
+static void wl_output_handle_mode(void *data, struct wl_output *output,
+  uint32_t flags, int32_t width, int32_t height, int32_t refresh);
+static void wl_output_info_done(void *data, struct wl_output *output);
+static void wl_output_handle_scale(void *data, struct wl_output *output,
+  int32_t factor);
+static void wl_output_handle_name(void *data, struct wl_output *output,
+  const char *name);
+static void wl_output_handle_description(void *data, struct wl_output *output,
+  const char *description);
+static void xdg_output_handle_logical_position(void *data,
+  struct zxdg_output_v1 *xdg_output, int32_t x, int32_t y);
+static void xdg_output_handle_logical_size(void *data,
+  struct zxdg_output_v1 *xdg_output, int32_t width, int32_t height);
+static void xdg_output_info_done(void *data,
+  struct zxdg_output_v1 *xdg_output);
+static void xdg_output_handle_name(void *data,
+  struct zxdg_output_v1 *xdg_output, const char *name);
+static void xdg_output_handle_description(void *data,
+  struct zxdg_output_v1 *xdg_output, const char *description);
+static void layer_surface_configure(void *data,
+  struct zwlr_layer_surface_v1 *layer_surface, uint32_t serial, uint32_t width,
+  uint32_t height);
 
 /*********************/
 /* libinput handling */
 /*********************/
 
-static int li_open_restricted(const char *path, int, void *);
-static void li_close_restricted(int, void *);
+/*
+ * Opens evdev devices for libinput, grabbing them with EVIOCGRAB so that they
+ * can't be used by other applications on the system.
+ */
+static int li_open_restricted(const char *path, int flags, void * user_data);
+
+/*
+ * Closes evdev devices for libinput.
+ */
+static void li_close_restricted(int fd, void *user_data);
 
 /************************/
 /* high-level functions */
 /************************/
 
-static void draw_frame(struct drawable_layer *);
-static void allocate_drawable_layer(struct disp_state *,
-  struct drawable_layer *, struct wl_output *);
-static void damage_surface_enh(struct wl_surface *, int32_t, int32_t, int32_t,
-  int32_t);
-static void update_virtual_cursor(uint32_t);
-static void handle_libinput_event(enum libinput_event_type,
-  struct libinput_event *, uint32_t);
-static void schedule_libinput_event(enum libinput_event_type,
-  struct libinput_event *);
-static void release_scheduled_libinput_events(void);
+/*
+ * Attempts to update the specified layer to display the virtual cursor at the
+ * right location. May do nothing if the compositor has not yet acknowledged a
+ * previously sent frame, there is no pending changes that affect the
+ * specified layer, or kloak hasn't yes negotiated an appropriate
+ * configuration for the layer with the compositor.
+ */
+static void draw_frame(struct drawable_layer *layer);
+
+/*
+ * Allocates a drawable_layer struct for the specified display, and registers
+ * it with the compositor.
+ */
+static struct drawable_layer *allocate_drawable_layer(
+  struct disp_state *state, struct wl_output *output);
+
+/*
+ * Damages the specified region of the specified surface. Takes the same
+ * arguments as wl_surface_damage_buffer, but clamps the x and y parameters to
+ * 0 if they're below zero when passed in. This works around undesirable
+ * behavior when passing negative x and y values to wl_surface_damage_buffer.
+ */
+static void damage_surface_enh(struct wl_surface *surface, int32_t x,
+  int32_t y, int32_t width, int32_t height);
+
+/*
+ * Updates the virtual cursor's position based on the global cursor_x and
+ * cursor_y variables. This will create a new mouse movement event if there
+ * isn't one already queued, and update a queued mouse movement event to
+ * reflect the current virtual cursor position otherwise.
+ */
+static struct input_packet * update_virtual_cursor(uint32_t ts_milliseconds);
+
+/*
+ * Processes a libinput event, sending emulated input to the compositor as
+ * appropriate.
+ */
+static void handle_libinput_event(enum libinput_event_type ev_type,
+  struct libinput_event *li_event, uint32_t ts_milliseconds);
+
+/*
+ * Schedules a libinput event for future release to the compositor. As a side
+ * effect, also redraws the virtual cursor if needed.
+ */
+static void queue_libinput_event_and_relocate_virtual_cursor(
+  enum libinput_event_type li_event_type, struct libinput_event *li_event);
+
+/*
+ * Finds all queued input events that are ready to be released, and process
+ * them.
+ */
+static void release_scheduled_input_events(void);
+
+/*
+ * Prints usage information.
+ */
+static void print_usage(void);
 
 /****************************/
 /* initialization functions */
 /****************************/
 
+/*
+ * Opens /dev/urandom so that other parts of the system that need random
+ * values can get them.
+ */
 static void applayer_random_init(void);
+
+/*
+ * Connects to the wayland compositor and begins initialization of the Wayland
+ * state.
+ */
 static void applayer_wayland_init(void);
+
+/*
+ * Opens all input devices on seat0 with libinput and prepares to process
+ * events from them.
+ */
 static void applayer_libinput_init(void);
+
+/*
+ * Initializes the fd poll mechanism.
+ */
 static void applayer_poll_init(void);
+
+/*
+ * Parses command-line arguments.
+ */
+static void parse_cli_args(int argc, char **argv);
 
 /*********************/
 /* wayland callbacks */
