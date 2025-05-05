@@ -152,7 +152,65 @@ static int64_t random_between(int64_t lower, int64_t upper) {
   return (int64_t) lower + randval.val;
 }
 
-static void recalc_global_space(struct disp_state * state, bool allow_gaps) {
+static bool check_point_in_area(uint32_t x, uint32_t y, uint32_t rect_x,
+  uint32_t rect_y, uint32_t rect_width, uint32_t rect_height) {
+  if (x >= rect_x && x < rect_x + rect_width
+    && y >= rect_y && y < rect_y + rect_height) {
+    return true;
+  }
+  return false;
+}
+
+static bool check_screen_touch(struct output_geometry scr1,
+  struct output_geometry scr2) {
+  /*
+   * We check for both touching and overlapping screens. Screens are
+   * overlapping if any of one screen's corner points falls inside the area of
+   * the other screen. The criteria to establish touching screens is a bit
+   * tricky, but a shortcut we can take is to simply grow the size of one of
+   * the screens by one pixel in every direction (i.e., subtract one from both
+   * the X and Y position coordinates and then add two to the width and
+   * height). Then any form of screen touching will be seen as an overlap,
+   * including touching at the corners.
+   *
+   * TODO: Do we actually *want* to allow touching at the corners? kloak's
+   * current algorithm seems to deal with that particular edge case
+   * acceptably well...
+   */
+
+  if (scr1.x > 0) {
+    scr1.x -= 1;
+    scr1.width += 2;
+  } else {
+    scr1.width += 1;
+  }
+  if (scr1.y > 0) {
+    scr1.y -= 1;
+    scr1.height += 2;
+  } else {
+    scr1.height += 1;
+  }
+
+  if (check_point_in_area(scr1.x, scr1.y, scr2.x, scr2.y, scr2.x + scr2.width,
+    scr2.y + scr2.height)) {
+    return true;
+  }
+  if (check_point_in_area(scr1.x + scr1.width, scr1.y, scr2.x, scr2.y,
+    scr2.x + scr2.width, scr2.y + scr2.height)) {
+    return true;
+  }
+  if (check_point_in_area(scr1.x, scr1.y + scr1.height, scr2.x, scr2.y,
+    scr2.x + scr2.width, scr2.y + scr2.height)) {
+    return true;
+  }
+  if (check_point_in_area(scr1.x + scr1.width, scr1.y + scr1.height, scr2.x,
+    scr2.y, scr2.x + scr2.width, scr2.y + scr2.height)) {
+    return true;
+  }
+  return false;
+}
+
+static void recalc_global_space(struct disp_state * state) {
   uint32_t ul_corner_x = UINT32_MAX;
   uint32_t ul_corner_y = UINT32_MAX;
   uint32_t br_corner_x = 0;
@@ -163,8 +221,6 @@ static void recalc_global_space(struct disp_state * state, bool allow_gaps) {
 
   for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
     if (!state->output_geometries[i])
-      continue;
-    if (!state->output_geometries[i]->init_done)
       continue;
     screen_list[screen_list_len] = state->output_geometries[i];
     ++screen_list_len;
@@ -225,10 +281,7 @@ static void recalc_global_space(struct disp_state * state, bool allow_gaps) {
         continue;
       struct output_geometry *conn_screen = conn_screen_list[i];
       struct output_geometry *cur_screen = screen_list[j];
-      if ((conn_screen->x == cur_screen->x + cur_screen->width)
-        || (conn_screen->x + conn_screen->width == cur_screen->x)
-        || (conn_screen->y == cur_screen->y + cur_screen->height)
-        || (conn_screen->y + conn_screen->height == cur_screen->y) ) {
+      if (check_screen_touch(*conn_screen, *cur_screen)) {
         /* Found a touching screen! */
         conn_screen_list[conn_screen_list_len] = cur_screen;
         ++conn_screen_list_len;
@@ -237,19 +290,6 @@ static void recalc_global_space(struct disp_state * state, bool allow_gaps) {
   }
 
   if (conn_screen_list_len != screen_list_len) {
-    if (allow_gaps) {
-      /* We temporarily allow gaps between screens if the user just unplugged
-       * a display, since if there are gaps between the screens when this is
-       * done, the compositor will (or at least *should*) immediately "squish"
-       * the remaining screens back together. If it doesn't do this, the
-       * user will find that the virtual cursor (and therefore the real
-       * cursor) is stuck on one group of screens and can't cross the gap to
-       * get to the others. There's very little we can do to detect that
-       * condition other than crude polling, so for now we just assume the
-       * compositor does the right thing. (labwc at the very least does indeed
-       * do the right thing here.) */
-      return;
-    }
     fprintf(stderr,
       "FATAL ERROR: Multiple screens are attached and gaps are present between them. kloak cannot operate in this configuration.\n");
     exit(1);
@@ -257,6 +297,8 @@ static void recalc_global_space(struct disp_state * state, bool allow_gaps) {
 
   state->global_space_width = br_corner_x;
   state->global_space_height = br_corner_y;
+  state->pointer_space_x = ul_corner_x;
+  state->pointer_space_y = ul_corner_y;
 }
 
 static struct screen_local_coord abs_coord_to_screen_local_coord(int32_t x,
@@ -265,9 +307,6 @@ static struct screen_local_coord abs_coord_to_screen_local_coord(int32_t x,
 
   for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
     if (!state.output_geometries[i]) {
-      continue;
-    }
-    if (!state.output_geometries[i]->init_done) {
       continue;
     }
     if (!(x >= state.output_geometries[i]->x)) {
@@ -473,7 +512,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
           zxdg_output_v1_add_listener(state->xdg_outputs[i],
             &xdg_output_listener, state);
           wl_output_add_listener(state->outputs[i], &output_listener, state);
-          state->output_geometries[i] = calloc(1,
+          state->pending_output_geometries[i] = calloc(1,
             sizeof(struct output_geometry));
         }
         new_layer_allocated = true;
@@ -499,7 +538,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
           zxdg_output_v1_add_listener(state->xdg_outputs[i],
             &xdg_output_listener, state);
           wl_output_add_listener(state->outputs[i], &output_listener, state);
-          state->output_geometries[i] = calloc(1,
+          state->pending_output_geometries[i] = calloc(1,
             sizeof(struct output_geometry));
         }
       }
@@ -534,7 +573,8 @@ static void registry_handle_global_remove(void *data,
         state->output_names[i] = 0;
         zxdg_output_v1_destroy(state->xdg_outputs[i]);
         state->xdg_outputs[i] = NULL;
-        free(state->output_geometries[i]);
+        free(state->pending_output_geometries[i]);
+        state->pending_output_geometries[i] = NULL;
         state->output_geometries[i] = NULL;
         wl_surface_destroy(layer->surface);
         if (layer->pixbuf != NULL) {
@@ -545,7 +585,7 @@ static void registry_handle_global_remove(void *data,
         }
         free(layer);
         state->layers[i] = NULL;
-        recalc_global_space(state, true);
+        recalc_global_space(state);
         break;
       }
     }
@@ -669,12 +709,12 @@ static void wl_output_info_done(void *data, struct wl_output *output) {
   struct disp_state *state = data;
   for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
     if (state->outputs[i] == output) {
-      struct output_geometry *geometry = state->output_geometries[i];
+      struct output_geometry *geometry = state->pending_output_geometries[i];
       if (geometry->x == 0 && geometry->y == 0 && geometry->width == 0
         && geometry->height == 0)
         return;
-      state->output_geometries[i]->init_done = true;
-      recalc_global_space(state, false);
+      state->output_geometries[i] = state->pending_output_geometries[i];
+      recalc_global_space(state);
       break;
     }
   }
@@ -700,8 +740,8 @@ static void xdg_output_handle_logical_position(void *data,
   struct disp_state *state = data;
   for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
     if (state->xdg_outputs[i] == xdg_output) {
-      state->output_geometries[i]->x = x;
-      state->output_geometries[i]->y = y;
+      state->pending_output_geometries[i]->x = x;
+      state->pending_output_geometries[i]->y = y;
       break;
     }
   }
@@ -712,8 +752,8 @@ static void xdg_output_handle_logical_size(void *data,
   struct disp_state *state = data;
   for (size_t i = 0; i < MAX_DRAWABLE_LAYERS; ++i) {
     if (state->xdg_outputs[i] == xdg_output) {
-      state->output_geometries[i]->width = width;
-      state->output_geometries[i]->height = height;
+      state->pending_output_geometries[i]->width = width;
+      state->pending_output_geometries[i]->height = height;
       break;
     }
   }
@@ -908,6 +948,7 @@ static struct input_packet * update_virtual_cursor(uint32_t ts_milliseconds) {
     /* We've somehow gotten into a spot where the previous coordinate data
      * either is invalid or points at an area where there is no screen. Reset
      * everything in the hopes of recovering sanity. */
+    printf("Resetting!\n");
     for (int32_t i = 0; i < MAX_DRAWABLE_LAYERS; i++) {
       if (state.layers[i]) {
         struct coord sane_location = screen_local_coord_to_abs_coord(0, 0, i);
@@ -1219,8 +1260,8 @@ static void queue_libinput_event_and_relocate_virtual_cursor(
     prev_cursor_y = cursor_y;
     cursor_x += rel_x;
     cursor_y += rel_y;
-    if (cursor_x < 0) cursor_x = 0;
-    if (cursor_y < 0) cursor_y = 0;
+    if (cursor_x < state.pointer_space_x) cursor_x = state.pointer_space_x;
+    if (cursor_y < state.pointer_space_y) cursor_y = state.pointer_space_y;
     if (cursor_x > state.global_space_width - 1)
       cursor_x = state.global_space_width - 1;
     if (cursor_y > state.global_space_height - 1)
@@ -1259,8 +1300,10 @@ static void release_scheduled_input_events(void) {
     } else {
       zwlr_virtual_pointer_v1_motion_absolute(
         state.virt_pointer, (uint32_t) packet->sched_time,
-        (uint32_t) packet->cursor_x, (uint32_t) packet->cursor_y,
-        state.global_space_width, state.global_space_height);
+        (uint32_t) packet->cursor_x - state.pointer_space_x,
+        (uint32_t) packet->cursor_y - state.pointer_space_y,
+        state.global_space_width - state.pointer_space_x,
+        state.global_space_height - state.pointer_space_y);
       zwlr_virtual_pointer_v1_frame(state.virt_pointer);
     }
     TAILQ_REMOVE(&head, packet, entries);

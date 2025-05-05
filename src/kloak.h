@@ -59,7 +59,6 @@ struct output_geometry {
   int32_t y;
   int32_t width;
   int32_t height;
-  bool init_done;
 };
 
 /*
@@ -124,8 +123,11 @@ struct disp_state {
   struct zxdg_output_manager_v1 *xdg_output_manager;
   struct zxdg_output_v1 *xdg_outputs[MAX_DRAWABLE_LAYERS];
   struct output_geometry *output_geometries[MAX_DRAWABLE_LAYERS];
+  struct output_geometry *pending_output_geometries[MAX_DRAWABLE_LAYERS];
   uint32_t global_space_width;
   uint32_t global_space_height;
+  uint32_t pointer_space_x;
+  uint32_t pointer_space_y;
   struct zwlr_layer_shell_v1 *layer_shell;
   struct zwlr_virtual_pointer_manager_v1 *virt_pointer_manager;
   struct zwp_virtual_keyboard_manager_v1 *virt_kb_manager;
@@ -186,13 +188,25 @@ static int64_t current_time_ms(void);
 static int64_t random_between(int64_t lower, int64_t upper);
 
 /*
- * Calculates the size of the global compositor space from the geometries of
- * the active displays. The function detects if there are gaps between the
- * displays and aborts the program if so. If allow_gaps is set to true, gaps
- * will not cause the program to abort, but the compositor global space values
- * will not be updated if gaps are detected.
+ * Determine if a point falls inside an area.
  */
-static void recalc_global_space(struct disp_state * state, bool allow_gaps);
+static bool check_point_in_area(uint32_t x, uint32_t y, uint32_t rect_x,
+  uint32_t rect_y, uint32_t rect_width, uint32_t rect_height);
+
+/*
+ * Determine if two screens are touching or overlapping given their
+ * geometries.
+ */
+static bool check_screen_touch(struct output_geometry scr1,
+  struct output_geometry scr2);
+
+/*
+ * Calculates the size of the global compositor space and the location of the
+ * upper-left corner of the pointer's coordinate space from the geometries of
+ * the active displays. The function detects if there are gaps between the
+ * displays and aborts the program if so.
+ */
+static void recalc_global_space(struct disp_state * state);
 
 /*
  * Converts a set of coordinates in global compositor space to a set of
